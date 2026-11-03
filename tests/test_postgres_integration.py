@@ -51,6 +51,117 @@ class PostgresIntegrationTests(unittest.TestCase):
         for table in ("blocks", "transactions", "receipts", "logs"):
             self.assertEqual(self.store.count(table, 1874), 0)
 
+    def test_m4_evaluation_evidence_and_rollback_invalidation(self):
+        from orbis.rules.registry import RuleRegistry
+        from orbis.rules.evidence import make_item, make_envelope
+        from orbis.rules.identity import evaluation_identity
+        from orbis.rules.repository import EvaluationRepository
+        from orbis.rules.normalization import digest
+        chain=1981
+        genesis={"number":"0x0","hash":"0xunrelated","parentHash":"0xparent","timestamp":"0x0","transactions":[]}
+        self.store.commit_block(chain,genesis,[],[])
+        block={"number":"0x1","hash":"0xevblock","parentHash":"0xparent","timestamp":"0x1","transactions":[]}
+        self.store.commit_block(chain,block,[],[])
+        version=RuleRegistry(self.store.db).register(rule_id="T-01",semantic_version="1.0.0",input_schema={},parameter_schema={},coverage_requirements={"required":[]})
+        item=make_item(network_chain_id=chain,block_number=1,block_hash="0xevblock",source_kind="block",normalized_input={"timestamp":"1"})
+        rule_doc={"rule_id":"T-01","semantic_version":"1.0.0","definition_digest":version["definition_digest"]}
+        envelope=make_envelope(network_chain_id=chain,bounds={"from":1,"to":1},rule=rule_doc,parameters={},evaluator_build="test-build",coverage={},items=[item])
+        context=envelope["context_digest"]
+        key=evaluation_identity(chain_id=chain,subject_kind="address",subject_key="0x"+"ab"*20,rule_id=version["rule_id"],semantic_version=version["semantic_version"],definition_digest=version["definition_digest"],from_block=1,to_block=1,parameters={},context_digest=context,evaluator_build="test-build")
+        network=self.store._network_id(chain)
+        repo=EvaluationRepository(self.store.db)
+        evaluation=repo.create(network_id=network,rule_version=version,subject_kind="address",subject_key="0x"+"ab"*20,
+            from_block=1,to_block=1,parameters={},context_digest=context,evaluator_build="test-build",evaluation_key=key,
+            coverage={},envelope=envelope,outcome="matched",findings=[{"result":{"kind":"test"}}])
+        other_item=make_item(network_chain_id=chain,block_number=0,block_hash="0xunrelated",source_kind="block",normalized_input={"timestamp":"0"})
+        other_envelope=make_envelope(network_chain_id=chain,bounds={"from":0,"to":0},rule=rule_doc,parameters={},evaluator_build="test-build",coverage={},items=[other_item])
+        other_key=evaluation_identity(chain_id=chain,subject_kind="address",subject_key="0x"+"ef"*20,rule_id=version["rule_id"],semantic_version=version["semantic_version"],definition_digest=version["definition_digest"],from_block=0,to_block=0,parameters={},context_digest=other_envelope["context_digest"],evaluator_build="test-build")
+        unaffected=repo.create(network_id=network,rule_version=version,subject_kind="address",subject_key="0x"+"ef"*20,from_block=0,to_block=0,parameters={},context_digest=other_envelope["context_digest"],evaluator_build="test-build",evaluation_key=other_key,coverage={},envelope=other_envelope,outcome="not_matched")
+        self.store.rollback_from(chain,1)
+        historical=repo.get(network,evaluation["evaluation_id"])
+        self.assertEqual(historical["canonicality"],"invalidated")
+        self.assertEqual(len(historical["findings"]),1)
+        self.assertEqual(self.store.db.execute("SELECT canonicality FROM evaluations WHERE evaluation_id=%s",(unaffected["evaluation_id"],)).fetchone()["canonicality"],"active")
+        self.assertEqual(self.store.db.execute("SELECT count(*) AS n FROM evaluation_invalidations WHERE evaluation_id=%s",(evaluation["evaluation_id"],)).fetchone()["n"],1)
+        self.store.rollback_from(chain,1)
+        self.assertEqual(self.store.db.execute("SELECT count(*) AS n FROM evaluation_invalidations WHERE evaluation_id=%s",(evaluation["evaluation_id"],)).fetchone()["n"],1)
+        replacement_item=make_item(network_chain_id=chain,block_number=1,block_hash="0xreplacement",source_kind="block",normalized_input={"timestamp":"2"})
+        self.store.commit_block(chain,{"number":"0x1","hash":"0xreplacement","parentHash":"0xunrelated","timestamp":"0x2","transactions":[]},[],[])
+        replacement_envelope=make_envelope(network_chain_id=chain,bounds={"from":1,"to":1},rule=rule_doc,parameters={},evaluator_build="test-build",coverage={},items=[replacement_item])
+        replacement_key=evaluation_identity(chain_id=chain,subject_kind="address",subject_key="0x"+"ab"*20,rule_id=version["rule_id"],semantic_version=version["semantic_version"],definition_digest=version["definition_digest"],from_block=1,to_block=1,parameters={},context_digest=replacement_envelope["context_digest"],evaluator_build="test-build")
+        self.assertNotEqual(key,replacement_key)
+        replacement=repo.create(network_id=network,rule_version=version,subject_kind="address",subject_key="0x"+"ab"*20,from_block=1,to_block=1,parameters={},context_digest=replacement_envelope["context_digest"],evaluator_build="test-build",evaluation_key=replacement_key,coverage={},envelope=replacement_envelope,outcome="not_matched",supersedes_evaluation_id=evaluation["evaluation_id"])
+        self.assertEqual(replacement["supersedes_evaluation_id"],evaluation["evaluation_id"])
+
+    def test_m4_invalidation_rolls_back_with_source_delete_failure(self):
+        from orbis.rules.registry import RuleRegistry
+        from orbis.rules.evidence import make_item, make_envelope
+        from orbis.rules.identity import evaluation_identity
+        from orbis.rules.repository import EvaluationRepository
+        chain=1982
+        block={"number":"0x1","hash":"0xfailblock","parentHash":"0xparent","timestamp":"0x1","transactions":[]}
+        self.store.commit_block(chain,block,[],[])
+        version=RuleRegistry(self.store.db).register(rule_id="T-02",semantic_version="1.0.0",input_schema={},parameter_schema={})
+        item=make_item(network_chain_id=chain,block_number=1,block_hash="0xfailblock",source_kind="block",normalized_input={})
+        env=make_envelope(network_chain_id=chain,bounds={"from":1,"to":1},rule={"rule_id":"T-02","semantic_version":"1.0.0","definition_digest":version["definition_digest"]},parameters={},evaluator_build="test",coverage={},items=[item])
+        subject="0x"+"cd"*20
+        key=evaluation_identity(chain_id=chain,subject_kind="address",subject_key=subject,rule_id=version["rule_id"],semantic_version=version["semantic_version"],definition_digest=version["definition_digest"],from_block=1,to_block=1,parameters={},context_digest=env["context_digest"],evaluator_build="test")
+        network=self.store._network_id(chain)
+        ev=EvaluationRepository(self.store.db).create(network_id=network,rule_version=version,subject_kind="address",subject_key=subject,from_block=1,to_block=1,parameters={},context_digest=env["context_digest"],evaluator_build="test",evaluation_key=key,coverage={},envelope=env,outcome="not_matched")
+        self.store.db.execute("CREATE FUNCTION fail_m4_delete() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected m4 rollback failure'; END $$")
+        self.store.db.execute("CREATE TRIGGER fail_m4_delete BEFORE DELETE ON blocks FOR EACH ROW EXECUTE FUNCTION fail_m4_delete()")
+        try:
+            with self.assertRaisesRegex(self.psycopg.Error,"injected m4 rollback failure"):
+                self.store.rollback_from(chain,1)
+        finally:
+            self.store.db.execute("DROP TRIGGER fail_m4_delete ON blocks")
+            self.store.db.execute("DROP FUNCTION fail_m4_delete()")
+        state=self.store.db.execute("SELECT canonicality FROM evaluations WHERE evaluation_id=%s",(ev["evaluation_id"],)).fetchone()["canonicality"]
+        self.assertEqual(state,"active")
+        self.assertEqual(self.store.db.execute("SELECT count(*) AS n FROM evaluation_invalidations WHERE evaluation_id=%s",(ev["evaluation_id"],)).fetchone()["n"],0)
+        self.assertEqual(self.store.count("blocks",chain),1)
+
+    def test_m4_concurrent_idempotent_negative_evaluation(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from threading import Barrier
+        from psycopg.rows import dict_row
+        from orbis.rules.registry import RuleRegistry
+        from orbis.rules.evidence import make_envelope
+        from orbis.rules.identity import evaluation_identity
+        from orbis.rules.repository import EvaluationRepository
+        chain=1983
+        version=RuleRegistry(self.store.db).register(rule_id="T-03",semantic_version="1.0.0",input_schema={},parameter_schema={})
+        envelope=make_envelope(network_chain_id=chain,bounds={"from":3,"to":3},rule={"rule_id":"T-03","semantic_version":"1.0.0","definition_digest":version["definition_digest"]},parameters={},evaluator_build="build",coverage={},items=[])
+        network=self.store._network_id(chain)
+        key=evaluation_identity(chain_id=chain,subject_kind="wallet",subject_key="subject-1",rule_id=version["rule_id"],semantic_version=version["semantic_version"],definition_digest=version["definition_digest"],from_block=3,to_block=3,parameters={},context_digest=envelope["context_digest"],evaluator_build="build")
+        barrier=Barrier(2)
+        def create_one():
+            with self.psycopg.connect(os.environ["ORBIS_TEST_DATABASE_URL"],row_factory=dict_row) as db:
+                db.execute(self.psycopg.sql.SQL("SET search_path TO {}").format(self.psycopg.sql.Identifier(self.schema)))
+                dbrow=db.execute("SELECT * FROM rule_versions WHERE rule_version_id=%s",(version["rule_version_id"],)).fetchone()
+                barrier.wait()
+                return EvaluationRepository(db).create(network_id=network,rule_version=dbrow,subject_kind="wallet",subject_key="subject-1",from_block=3,to_block=3,parameters={},context_digest=envelope["context_digest"],evaluator_build="build",evaluation_key=key,coverage={},envelope=envelope,outcome="not_matched")["evaluation_id"]
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            ids=list(pool.map(lambda _:create_one(),range(2)))
+        self.assertEqual(ids[0],ids[1])
+        self.assertEqual(self.store.db.execute("SELECT count(*) AS n FROM evaluations WHERE network_id=%s AND evaluation_key=%s",(network,key)).fetchone()["n"],1)
+        self.assertEqual(self.store.db.execute("SELECT count(*) AS n FROM findings WHERE network_id=%s AND evaluation_id=%s",(network,ids[0])).fetchone()["n"],0)
+
+    def test_m4_failed_execution_persists_without_findings(self):
+        from orbis.rules.registry import RuleRegistry
+        from orbis.rules.evidence import make_envelope
+        from orbis.rules.identity import evaluation_identity
+        from orbis.rules.repository import EvaluationRepository
+        chain=1984
+        version=RuleRegistry(self.store.db).register(rule_id="T-04",semantic_version="1.0.0",input_schema={},parameter_schema={})
+        envelope=make_envelope(network_chain_id=chain,bounds={"from":7,"to":7},rule={"rule_id":"T-04","semantic_version":"1.0.0","definition_digest":version["definition_digest"]},parameters={},evaluator_build="build",coverage={},items=[])
+        network=self.store._network_id(chain)
+        key=evaluation_identity(chain_id=chain,subject_kind="wallet",subject_key="subject",rule_id=version["rule_id"],semantic_version=version["semantic_version"],definition_digest=version["definition_digest"],from_block=7,to_block=7,parameters={},context_digest=envelope["context_digest"],evaluator_build="build")
+        ev=EvaluationRepository(self.store.db).record_failure(network_id=network,rule_version=version,subject_kind="wallet",subject_key="subject",from_block=7,to_block=7,parameters={},context_digest=envelope["context_digest"],evaluator_build="build",evaluation_key=key,coverage={},envelope=envelope,diagnostics={"error":"fixture failure"})
+        self.assertEqual(ev["execution_status"],"failed")
+        self.assertIsNone(ev["analytical_outcome"])
+        self.assertEqual(self.store.db.execute("SELECT count(*) AS n FROM findings WHERE network_id=%s AND evaluation_id=%s",(network,ev["evaluation_id"])).fetchone()["n"],0)
+
     def test_reopen_recovers_checkpoint_and_reorg_can_replay(self):
         genesis = {"number": "0x0", "hash": "0xgenesis", "parentHash": "0xzero", "timestamp": "0x10", "transactions": []}
         old = {"number": "0x1", "hash": "0xold", "parentHash": "0xgenesis", "timestamp": "0x11", "transactions": []}

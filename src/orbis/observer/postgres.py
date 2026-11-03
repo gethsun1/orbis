@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import psycopg
 from psycopg.rows import dict_row
@@ -102,6 +103,7 @@ class PostgresStore:
             if not row:
                 return
             network_id = row["network_id"]
+            self._invalidate_m4_for_suffix(network_id, number, str(uuid4()), "canonical suffix rollback")
             # Retract derived knowledge before deleting its source suffix. Replayed
             # canonical records will be enriched again by the independent pipeline.
             evidence = self.db.execute("""SELECT e.evidence_id FROM evidence_refs e JOIN observations o
@@ -147,6 +149,31 @@ class PostgresStore:
                 self.db.execute("INSERT INTO checkpoints VALUES(%s,%s,%s) ON CONFLICT(network_id) DO UPDATE SET block_number=EXCLUDED.block_number,block_hash=EXCLUDED.block_hash", (network_id, previous["number"], previous["hash"]))
             else:
                 self.db.execute("DELETE FROM checkpoints WHERE network_id=%s", (network_id,))
+
+    def _invalidate_m4_for_suffix(self, network_id: int, number: int, rollback_id: str, reason: str) -> None:
+        """Invalidate retained results before source deletion, on the caller's transaction."""
+        if not self.db.execute("SELECT to_regclass('evaluation_evidence') AS relation").fetchone()["relation"]:
+            return
+        orphaned = self.db.execute("SELECT number,hash FROM blocks WHERE network_id=%s AND number >= %s ORDER BY number FOR UPDATE", (network_id, number)).fetchall()
+        hashes = sorted({row["hash"] for row in orphaned})
+        if not hashes:
+            return
+        affected_rows = self.db.execute("""SELECT e.evaluation_id FROM evaluations e
+            JOIN evaluation_evidence v USING(network_id,evaluation_id)
+            WHERE e.network_id=%s AND e.canonicality='active' AND v.block_hash = ANY(%s)
+            ORDER BY e.evaluation_id FOR UPDATE OF e""", (network_id, hashes)).fetchall()
+        for evaluation_id in sorted({r["evaluation_id"] for r in affected_rows}):
+            eval_hashes = self.db.execute("""SELECT DISTINCT block_hash FROM evaluation_evidence
+                WHERE network_id=%s AND evaluation_id=%s AND block_hash = ANY(%s) ORDER BY block_hash""",
+                (network_id,evaluation_id,hashes)).fetchall()
+            finding_ids = self.db.execute("SELECT finding_id FROM findings WHERE network_id=%s AND evaluation_id=%s ORDER BY finding_id",(network_id,evaluation_id)).fetchall()
+            changed = self.db.execute("UPDATE evaluations SET canonicality='invalidated',invalidated_at=now() WHERE network_id=%s AND evaluation_id=%s AND canonicality='active' RETURNING invalidated_at",(network_id,evaluation_id)).fetchone()
+            if changed:
+                self.db.execute("""INSERT INTO evaluation_invalidations(network_id,evaluation_id,affected_finding_ids,
+                    rollback_from_block,orphaned_block_hashes,reason,invalidated_at,rollback_id,prior_canonicality)
+                    VALUES(%s,%s,%s,%s,%s,%s,%s,%s,'active') ON CONFLICT(network_id,evaluation_id) DO NOTHING""",
+                    (network_id,evaluation_id,json.dumps([r["finding_id"] for r in finding_ids]),number,
+                     json.dumps([r["block_hash"] for r in eval_hashes]),reason,changed["invalidated_at"],rollback_id))
 
     def count(self, table: str, chain_id: int) -> int:
         if table not in {"blocks", "transactions", "receipts", "logs"}:
