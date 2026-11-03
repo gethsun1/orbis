@@ -69,12 +69,15 @@ class PostgresStore:
                 (network_id, number, block["hash"], block["parentHash"], int(block["timestamp"], 16)))
             self.db.execute("DELETE FROM transactions WHERE network_id=%s AND block_number=%s", (network_id, number))
             for index, tx in enumerate(block.get("transactions", [])):
+                sender = tx.get("from")
+                recipient = tx.get("to")
                 self.db.execute("""INSERT INTO transactions VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     ON CONFLICT(network_id,hash) DO UPDATE SET block_number=EXCLUDED.block_number,
                     block_hash=EXCLUDED.block_hash,tx_index=EXCLUDED.tx_index,sender=EXCLUDED.sender,
                     recipient=EXCLUDED.recipient,value=EXCLUDED.value,input_data=EXCLUDED.input_data""",
                     (network_id, tx["hash"], number, block["hash"], int(tx.get("transactionIndex", hex(index)), 16),
-                     tx.get("from"), tx.get("to"), tx.get("value", "0x0"), tx.get("input", "0x")))
+                     sender.lower() if sender else None, recipient.lower() if recipient else None,
+                     tx.get("value", "0x0"), tx.get("input", "0x")))
             receipt_by_hash = {r["transactionHash"].lower(): r for r in receipts}
             for receipt in receipts:
                 status = int(receipt["status"], 16) if isinstance(receipt.get("status"), str) else receipt.get("status")
@@ -88,7 +91,7 @@ class PostgresStore:
                     ON CONFLICT(network_id,transaction_hash,log_index) DO UPDATE SET block_number=EXCLUDED.block_number,
                     block_hash=EXCLUDED.block_hash,address=EXCLUDED.address,topics=EXCLUDED.topics,data=EXCLUDED.data,removed=EXCLUDED.removed""",
                     (network_id, log["transactionHash"], int(log["logIndex"], 16), number,
-                     log["blockHash"], log["address"], json.dumps(log.get("topics", [])), log.get("data", "0x"), bool(log.get("removed", False))))
+                     log["blockHash"], log["address"].lower(), json.dumps(log.get("topics", [])), log.get("data", "0x"), bool(log.get("removed", False))))
             self.db.execute("""INSERT INTO checkpoints VALUES(%s,%s,%s) ON CONFLICT(network_id) DO UPDATE SET
                 block_number=EXCLUDED.block_number,block_hash=EXCLUDED.block_hash
                 WHERE checkpoints.block_number <= EXCLUDED.block_number""", (network_id, number, block["hash"]))
@@ -112,8 +115,27 @@ class PostgresStore:
                                  (network_id, evidence_ids))
             self.db.execute("DELETE FROM observations WHERE network_id=%s AND derived AND source_block_number >= %s",
                             (network_id, number))
-            self.db.execute("""DELETE FROM relationships r WHERE network_id=%s AND NOT EXISTS
-                (SELECT 1 FROM relationship_evidence re WHERE re.network_id=r.network_id AND re.relationship_id=r.relationship_id)""",
+            # Rebuild summaries from the evidence that survived invalidation. Incremental
+            # LEAST/GREATEST leaves stale endpoints when the first/last supporting block
+            # is removed, and counting evidence rows overcounts repeated logs per tx.
+            self.db.execute("""UPDATE relationships r SET
+                first_observed_block=a.first_block,last_observed_block=a.last_block,
+                observation_count=a.tx_count,updated_at=now()
+                FROM (SELECT re.network_id,re.relationship_id,
+                    min(e.block_number) AS first_block,max(e.block_number) AS last_block,
+                    count(DISTINCT e.transaction_hash) AS tx_count
+                    FROM relationship_evidence re JOIN evidence_refs e
+                      USING(network_id,evidence_id)
+                    JOIN blocks b ON (b.network_id,b.number,b.hash)=
+                      (e.network_id,e.block_number,e.block_hash)
+                    WHERE re.network_id=%s AND b.canonical AND e.transaction_hash IS NOT NULL
+                    GROUP BY re.network_id,re.relationship_id) a
+                WHERE r.network_id=a.network_id AND r.relationship_id=a.relationship_id""", (network_id,))
+            self.db.execute("""DELETE FROM relationships r WHERE r.network_id=%s AND NOT EXISTS
+                (SELECT 1 FROM relationship_evidence re JOIN evidence_refs e
+                  USING(network_id,evidence_id) JOIN blocks b ON
+                  (b.network_id,b.number,b.hash)=(e.network_id,e.block_number,e.block_hash)
+                 WHERE re.network_id=r.network_id AND re.relationship_id=r.relationship_id AND b.canonical)""",
                 (network_id,))
             self.db.execute("""DELETE FROM entities e WHERE network_id=%s AND metadata ? 'discovery'
                 AND NOT EXISTS (SELECT 1 FROM observations o WHERE o.network_id=e.network_id AND o.entity_id=e.entity_id)

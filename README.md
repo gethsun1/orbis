@@ -2,13 +2,13 @@
 
 **Observe. Understand. Reason. Verify.**
 
-ORBIS is Whitechain-first on-chain intelligence infrastructure. It indexes real chain evidence, applies deterministic and explainable analysis, and exposes traceable results to applications and operators. The repository has completed the M2 persistence foundation; it does not yet provide an assessment API, intelligence rules, SDK, MCP server, or dashboard.
+ORBIS is Whitechain-first on-chain intelligence infrastructure. It indexes real chain evidence, applies deterministic and explainable analysis, and exposes traceable results to applications and operators. M3.1 engineering remediation and final bounded live validation passed. The repository does not yet provide an assessment API, deterministic intelligence rules, SDK, MCP server, or dashboard.
 
-## Current milestone: M3 — PostgreSQL knowledge layer (in progress)
+## Current milestone: M3 — PostgreSQL knowledge layer (M3.1 remediation implemented)
 
-The observer verifies the configured RPC chain ID, indexes a bounded range of blocks with receipts/logs, and stores its checkpoint atomically. The M3 knowledge service separately enriches persisted canonical transactions with network-scoped entities, participation observations and evidence-backed transaction/contract relationships. Reorg rollback retracts dependent derived knowledge. PostgreSQL is authoritative; SQLite remains a lightweight observer adapter. See the [M3 verification report](docs/M3_VERIFICATION_REPORT.md) and [M2 verification report](docs/M2_VERIFICATION_REPORT.md).
+The observer verifies the configured RPC chain ID, indexes bounded blocks with receipts/logs, and stores its checkpoint atomically. The M3 knowledge service separately enriches canonical transactions with network-scoped entities, transaction participation, individual log-emitter evidence, and validated relationships. Reorg rollback recomputes relationship summaries from surviving evidence. PostgreSQL is authoritative; SQLite remains a lightweight observer adapter. The final live validation indexed 150 Whitechain Sepolia blocks in an isolated PostgreSQL schema. See the [M3 engineering report](docs/M3_VERIFICATION_REPORT.md), [M3 live validation report](docs/M3_LIVE_VALIDATION_REPORT.md), and [M2 verification report](docs/M2_VERIFICATION_REPORT.md).
 
-The PRD's Whitechain-hosted testnet references conflict: the wallet configuration page lists chain ID 2625 and `rpc-testnet.whitechain.io`, while the developer guide lists chain ID 1874 and `rpc.testnet.whitechain.io`. Both first-party endpoints returned HTTP 403 in this environment. Ankr's Whitechain Sepolia endpoint, `https://rpc.ankr.com/whitechain_testnet`, returned chain ID 1874 and passed bounded block, transaction, receipt and log indexing on 3 November 2026. Configure that URL and `ORBIS_CHAIN_ID=1874` explicitly for verified M1 use; `.env.example` intentionally has no default. Whitechain DevRel confirmation of first-party endpoint configuration and limits remains open. See the [M1 verification report](docs/M1_VERIFICATION_REPORT.md). Sources: [Whitechain wallet configuration](https://docs.whitechain.io/general/wallet-configuration), [Whitechain developer guide](https://whitechain.io/blog/start-building-on-whitechain), [Ankr Whitechain endpoint notes](https://www.ankr.com/docs/changelog/whitechain-testnet/).
+The approved PRD's Whitechain testnet references list conflicting configurations. The earlier M1 report records HTTP 403 responses on 3 November and an Ankr testnet validation. On 4 November, the configured `rpc.testnet.whitechain.io` endpoint responded with chain ID 1874 and supported safe/finalized block tags for the bounded M3 validation. Endpoint behavior and first-party configuration confirmation can vary over time; `.env.example` intentionally supplies no endpoint default. See the [M1 verification report](docs/M1_VERIFICATION_REPORT.md) and [M3 live validation report](docs/M3_LIVE_VALIDATION_REPORT.md). Sources: [Whitechain wallet configuration](https://docs.whitechain.io/general/wallet-configuration), [Whitechain developer guide](https://whitechain.io/blog/start-building-on-whitechain).
 
 ## Requirements
 
@@ -21,7 +21,7 @@ The PRD's Whitechain-hosted testnet references conflict: the wallet configuratio
 PYTHONPATH=src python -m unittest discover -s tests -v
 ```
 
-The PostgreSQL integration tests are skipped unless `ORBIS_TEST_DATABASE_URL` points to a disposable PostgreSQL database. They create and remove an isolated test schema. To run only those tests, use `ORBIS_TEST_DATABASE_URL='postgresql://...' PYTHONPATH=src python -m unittest discover -s tests -p 'test_postgres_integration.py' -v`. They are separate from the SQLite unit tests.
+The PostgreSQL integration tests are skipped unless `ORBIS_TEST_DATABASE_URL` points to a disposable PostgreSQL database. They create and remove an isolated test schema. To run only those tests, load the ignored `.env` and use `PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_postgres_integration.py' -v`. The M3.1 verification run executed all 31 tests with 0 skips.
 
 To run the complete suite against the configured local PostgreSQL test database:
 

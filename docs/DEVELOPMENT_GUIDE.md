@@ -25,7 +25,7 @@ set -a; source .env; set +a
 .venv/bin/python -m unittest discover -s tests -v
 ```
 
-The regular suite uses deterministic fixtures, primarily SQLite, and a fake RPC adapter. PostgreSQL integration tests are a separate test class and require an explicitly configured disposable database; skipped tests do not count as PostgreSQL verification.
+The regular suite uses deterministic fixtures, primarily SQLite, and a fake RPC adapter. PostgreSQL integration tests are a separate test class and require an explicitly configured disposable database; skipped tests do not count as PostgreSQL verification. M3.1 verification ran the full suite with PostgreSQL enabled: 31 tests, 0 failures, 0 skips.
 
 ## Observer operations
 
@@ -33,7 +33,9 @@ Run a pass with `PYTHONPATH=src python -m orbis.cli`. The process verifies chain
 
 Use a separate database per environment. Data keys include network identity and chain-scoped blockchain identifiers. PostgreSQL migrations run at CLI startup and are also available as a command. Back up PostgreSQL with `pg_dump` after stopping the indexer and validate restoration with `pg_restore` before production use.
 
-Knowledge enrichment is a separate bounded operation. Initialize `PostgresStore`, then call `KnowledgeService(store).ingest(chain_id, limit=500)`; it reads persisted canonical records and is safe to retry. Do not call it against a SQLite observer store. Retrieval methods take a chain ID and address, and observations/history accept bounded page sizes. Reorg rollback retracts derived evidence and generated observations; rerun enrichment after the observer replays replacement blocks.
+Knowledge enrichment is a separate bounded operation. Initialize `PostgresStore`, then call `KnowledgeService(store).ingest(chain_id, limit=500)`; each call processes only newly claimed canonical transactions and returns the number completed. A database completion ledger makes retries, process restarts, empty-fact transactions, and concurrent workers safe. Use `ingestion_status(chain_id)` to inspect eligible, processed, and remaining records. Do not call the service against a SQLite observer store. Relationship and evidence retrieval accept bounded `limit`/`offset` pages. Reorg rollback retracts derived evidence, recomputes surviving relationship aggregates, and removes completion rows through transaction deletion; replayed transactions become eligible again.
+
+Migrations 006–008 add the M3.1 work ledger, receipt provenance, per-log observation identity, retrieval indexes, normalized participant addresses, and cleanup of legacy emitter-as-recipient edges. Apply migrations through `python -m orbis.db_migrate` using the development URL, then point `ORBIS_DATABASE_URL` at the test database and apply them there as well. The test suite also validates all migrations in isolated schemas. Do not reset either database to apply migrations.
 
 ## Contribution and milestone discipline
 

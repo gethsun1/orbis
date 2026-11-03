@@ -1,6 +1,6 @@
 # ORBIS implementation roadmap
 
-**Status:** M0 review complete; M1 and M2 accepted. The current owner-authorized M3 brief defines this milestone as the knowledge layer, advancing deterministic rules to a later gate; see [M3 verification report](M3_VERIFICATION_REPORT.md). Dates are unset pending capacity planning.
+**Status:** M0 review complete; M1 and M2 accepted; M3.1 engineering and final live validation passed. The current owner-authorized M3 brief defines this milestone as the knowledge layer and sequences the PRD's deterministic intelligence rules after knowledge review. See the [M3 engineering report](M3_VERIFICATION_REPORT.md) and [M3 live report](M3_LIVE_VALIDATION_REPORT.md). Dates are unset pending capacity planning.
 
 ## M0 — Product and architecture review (complete)
 
@@ -22,12 +22,13 @@
 - Three real Whitechain Sepolia blocks, four transactions, four receipts and two event logs persisted into PostgreSQL. Duplicate replay, checkpoint restart recovery and reorg rollback/replay passed; see the M2 verification report.
 - M2 accepted for this bounded persistence milestone. Production operations and the M3 intelligence engine remain out of scope.
 
-## M3 — Knowledge layer (current authorized scope)
+## M3 — Knowledge layer (owner-authorized scope; M3.1 remediation complete)
 
 - Implement network-aware entities, reproducible direct observations, evidence-backed relationships, transactional idempotent enrichment, retrieval and reorg invalidation.
 - Exit: PostgreSQL integration checks and a bounded live Whitechain knowledge demonstration; see M3 report.
+- M3.1 remediated partial-reorg relationship summaries, durable multi-batch enrichment, relationship semantics, receipt/log provenance, bounded retrieval and network isolation. Dev/test migration and full test results are in the M3 engineering report; 150 live Whitechain Sepolia blocks and enrichment evidence are in the live report.
 
-## M3b — Deterministic intelligence (PRD sequence deferred)
+## M3 intelligence gate — Deterministic rules (PRD M3 requirement, sequenced after knowledge review)
 
 - Select five feasible PRD detections; implement immutable rule versions, findings, severity/coverage and known limitations after the knowledge layer is reviewed.
 - Exit: unit/integration tests with fixtures and documented limitations; fixture outputs are clearly test-only.

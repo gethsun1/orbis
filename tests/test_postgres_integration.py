@@ -168,7 +168,8 @@ class PostgresIntegrationTests(unittest.TestCase):
         knowledge = KnowledgeService(self.store)
         self.assertEqual(normalize_address(address_a.upper().replace("0X","0x")),address_a)
         self.assertEqual(knowledge.ingest(1881),2)
-        self.assertEqual(knowledge.ingest(1881),2)
+        self.assertEqual(knowledge.ingest(1881),0)
+        self.assertEqual(knowledge.ingestion_status(1881),{"eligible":2,"processed":2,"remaining":0})
         self.assertEqual(knowledge.get_entity(1881,address_a.upper().replace("0X","0x"))["address"],address_a)
         self.assertEqual(len(knowledge.observations(1881,address_a)),2)
         self.assertEqual(len(knowledge.observations(1881,address_a,limit=1,offset=1)),1)
@@ -198,6 +199,233 @@ class PostgresIntegrationTests(unittest.TestCase):
         net=self.store.db.execute("SELECT network_id FROM networks WHERE chain_id=1883").fetchone()["network_id"]
         self.assertEqual(self.store.db.execute("SELECT count(*) c FROM entities WHERE network_id=%s",(net,)).fetchone()["c"],0)
         self.assertEqual(self.store.db.execute("SELECT count(*) c FROM observations WHERE network_id=%s",(net,)).fetchone()["c"],0)
+
+    def _knowledge_blocks(self, chain_id, start, count, sender, recipient, prefix="agg"):
+        for height in range(start, start + count):
+            tx_hash = f"0x{prefix}-tx-{height}"
+            block_hash = f"0x{prefix}-block-{height}"
+            block = {"number":hex(height),"hash":block_hash,"parentHash":f"0x{prefix}-parent-{height}",
+                     "timestamp":hex(100+height),"transactions":[{"hash":tx_hash,"from":sender,"to":recipient,"transactionIndex":"0x0"}]}
+            receipt = {"transactionHash":tx_hash,"blockNumber":hex(height),"blockHash":block_hash,"status":"0x1","logs":[]}
+            self.store.commit_block(chain_id,block,[receipt],[])
+
+    def test_reorg_recomputes_partial_relationship_aggregates_and_replay(self):
+        from orbis.knowledge import KnowledgeService
+        a,b="0x"+"a"*40,"0x"+"b"*40
+        for chain_id in (1901,1902,1903):
+            self._knowledge_blocks(chain_id,1,3,a,b,str(chain_id))
+            k=KnowledgeService(self.store); self.assertEqual(k.ingest(chain_id,10),3)
+            rel=k.relationships(chain_id,a)[0]
+            self.assertEqual((rel["first_observed_block"],rel["last_observed_block"],rel["observation_count"]),(1,3,3))
+            # A suffix reorg removes the selected endpoint or middle-and-later support.
+            invalid_from={1901:3,1902:2,1903:1}[chain_id]
+            self.store.rollback_from(chain_id,invalid_from)
+            remaining=k.relationships(chain_id,a)
+            if invalid_from == 1:
+                self.assertEqual(remaining,[])
+            else:
+                rel=remaining[0]
+                last=invalid_from-1
+                self.assertEqual((rel["first_observed_block"],rel["last_observed_block"],rel["observation_count"]),(1,last,last))
+            # Repeated invalidation is idempotent; replacement evidence rebuilds the summary.
+            self.store.rollback_from(chain_id,invalid_from)
+            if invalid_from == 1:
+                self._knowledge_blocks(chain_id,1,2,a,b,"replacement")
+                self.assertEqual(k.ingest(chain_id),2)
+                rel=k.relationships(chain_id,a)[0]
+                self.assertEqual((rel["first_observed_block"],rel["last_observed_block"],rel["observation_count"]),(1,2,2))
+
+    def test_replacement_block_can_omit_earliest_middle_or_latest_support(self):
+        from orbis.knowledge import KnowledgeService
+        sender,recipient="0x"+"a7"*20,"0x"+"a8"*20
+        original=[{"hash":f"0xreplace-{i}","from":sender,"to":recipient,"transactionIndex":hex(i)} for i in range(3)]
+        for chain,omitted in ((1920,0),(1921,1),(1922,2)):
+            old_hash=f"0xreplace-old-{chain}"
+            self.store.commit_block(chain,{"number":"0x1","hash":old_hash,"parentHash":"0x0","timestamp":"0x1","transactions":original},
+                [{"transactionHash":t["hash"],"blockNumber":"0x1","blockHash":old_hash,"status":"0x1","logs":[]} for t in original],[])
+            k=KnowledgeService(self.store); self.assertEqual(k.ingest(chain),3)
+            self.assertEqual(k.relationships(chain,sender)[0]["observation_count"],3)
+            self.store.rollback_from(chain,1)
+            new_hash=f"0xreplace-new-{chain}"
+            replacement=[t for i,t in enumerate(original) if i!=omitted]
+            self.store.commit_block(chain,{"number":"0x1","hash":new_hash,"parentHash":"0x0","timestamp":"0x2","transactions":replacement},
+                [{"transactionHash":t["hash"],"blockNumber":"0x1","blockHash":new_hash,"status":"0x1","logs":[]} for t in replacement],[])
+            self.assertEqual(k.ingest(chain),2)
+            rel=k.relationships(chain,sender)[0]
+            self.assertEqual((rel["first_observed_block"],rel["last_observed_block"],rel["observation_count"]),(1,1,2))
+
+    def test_rollback_failure_is_atomic_for_knowledge_and_chain_state(self):
+        from orbis.knowledge import KnowledgeService
+        a,b="0x"+"c"*40,"0x"+"d"*40
+        self._knowledge_blocks(1904,1,2,a,b,"atomic")
+        k=KnowledgeService(self.store); k.ingest(1904)
+        net=self.store.db.execute("SELECT network_id FROM networks WHERE chain_id=1904").fetchone()["network_id"]
+        self.store.db.execute("""CREATE FUNCTION fail_block_delete() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN RAISE EXCEPTION 'injected rollback failure'; END $$""")
+        self.store.db.execute("CREATE TRIGGER fail_block_delete BEFORE DELETE ON blocks FOR EACH ROW EXECUTE FUNCTION fail_block_delete()")
+        try:
+            with self.assertRaisesRegex(self.psycopg.Error,"injected rollback failure"):
+                self.store.rollback_from(1904,2)
+        finally:
+            self.store.db.execute("DROP TRIGGER fail_block_delete ON blocks")
+            self.store.db.execute("DROP FUNCTION fail_block_delete()")
+        self.assertEqual(self.store.count("blocks",1904),2)
+        self.assertEqual(k.ingestion_status(1904),{"eligible":2,"processed":2,"remaining":0})
+        self.assertEqual(k.relationships(1904,a)[0]["observation_count"],2)
+
+    def test_enrichment_processes_multiple_batches_and_empty_fact_transactions_once(self):
+        from orbis.knowledge import KnowledgeService
+        a,b="0x"+"e"*40,"0x"+"f"*40
+        chain=1905
+        txs=[{"hash":f"0xbatch-{i}","from":a if i%2==0 else None,"to":b if i%2==0 else None,"transactionIndex":hex(i)} for i in range(7)]
+        block={"number":"0x1","hash":"0xbatch-block","parentHash":"0x0","timestamp":"0x1","transactions":txs}
+        receipts=[{"transactionHash":t["hash"],"blockNumber":"0x1","blockHash":"0xbatch-block","status":"0x1","logs":[]} for t in txs]
+        self.store.commit_block(chain,block,receipts,[]); k=KnowledgeService(self.store)
+        self.assertEqual(k.ingestion_status(chain),{"eligible":7,"processed":0,"remaining":7})
+        counts=[k.ingest(chain,3),k.ingest(chain,3),k.ingest(chain,3),k.ingest(chain,3)]
+        self.assertEqual(counts,[3,3,1,0])
+        self.assertEqual(k.ingestion_status(chain),{"eligible":7,"processed":7,"remaining":0})
+        # Successful pages survive a service restart; failed pages never write progress.
+        self.assertEqual(KnowledgeService(self.store).ingest(chain,3),0)
+
+    def test_exact_batch_boundary_and_failure_in_middle_do_not_mark_partial_work(self):
+        from orbis.knowledge import KnowledgeService
+        for chain,number in ((1906,2),(1907,3)):
+            txs=[{"hash":f"0xexact-{chain}-{i}","from":"0x"+"7"*40,"to":"0x"+"8"*40,"transactionIndex":hex(i)} for i in range(number)]
+            block={"number":"0x1","hash":f"0xexact-block-{chain}","parentHash":"0x0","timestamp":"0x1","transactions":txs}
+            receipts=[{"transactionHash":t["hash"],"blockNumber":"0x1","blockHash":block["hash"],"status":"0x1","logs":[]} for t in txs]
+            self.store.commit_block(chain,block,receipts,[]); k=KnowledgeService(self.store)
+            self.assertEqual(k.ingest(chain,3),number)
+            self.assertEqual(k.ingestion_status(chain),{"eligible":number,"processed":number,"remaining":0})
+        chain=1908
+        good="0x"+"9"*40
+        txs=[{"hash":"0xfail-1","from":good,"to":good,"transactionIndex":"0x0"},
+             {"hash":"0xfail-2","from":good,"to":"0xmalformed","transactionIndex":"0x1"},
+             {"hash":"0xfail-3","from":good,"to":good,"transactionIndex":"0x2"}]
+        block={"number":"0x1","hash":"0xfail-block","parentHash":"0x0","timestamp":"0x1","transactions":txs}
+        self.store.commit_block(chain,block,[{"transactionHash":t["hash"],"blockNumber":"0x1","blockHash":block["hash"],"status":"0x1","logs":[]} for t in txs],[])
+        k=KnowledgeService(self.store)
+        with self.assertRaises(ValueError): k.ingest(chain,3)
+        self.assertEqual(k.ingestion_status(chain),{"eligible":3,"processed":0,"remaining":3})
+
+    def test_concurrent_enrichment_claims_each_transaction_once(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from orbis.knowledge import KnowledgeService
+        chain=1909; a,b="0x"+"c1"*20,"0x"+"c2"*20
+        txs=[{"hash":f"0xconcurrent-{i}","from":a,"to":b,"transactionIndex":hex(i)} for i in range(10)]
+        block={"number":"0x1","hash":"0xconcurrent-block","parentHash":"0x0","timestamp":"0x1","transactions":txs}
+        receipts=[{"transactionHash":t["hash"],"blockNumber":"0x1","blockHash":block["hash"],"status":"0x1","logs":[]} for t in txs]
+        self.store.commit_block(chain,block,receipts,[])
+        from orbis.observer.postgres import PostgresStore
+        other=PostgresStore(os.environ["ORBIS_TEST_DATABASE_URL"],schema=self.schema)
+        try:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                results=list(pool.map(lambda store:KnowledgeService(store).ingest(chain,5),(self.store,other)))
+            self.assertEqual(sorted(results),[5,5])
+            self.assertEqual(KnowledgeService(self.store).ingestion_status(chain),{"eligible":10,"processed":10,"remaining":0})
+        finally:
+            other.close()
+
+    def test_network_identity_and_evidence_are_isolated(self):
+        from orbis.knowledge import KnowledgeService
+        addr="0x"+"1"*40
+        for chain,height in ((1910,1),(1911,2)):
+            tx=f"0xnetwork-{chain}"; blockhash=f"0xnetwork-block-{chain}"
+            self.store.commit_block(chain,{"number":hex(height),"hash":blockhash,"parentHash":"0xparent","timestamp":"0x1",
+                "transactions":[{"hash":tx,"from":addr,"to":None,"transactionIndex":"0x0"}]},
+                [{"transactionHash":tx,"blockNumber":hex(height),"blockHash":blockhash,"status":"0x1","logs":[]}],[])
+            KnowledgeService(self.store).ingest(chain)
+        one,two=KnowledgeService(self.store).get_entity(1910,addr),KnowledgeService(self.store).get_entity(1911,addr)
+        self.assertNotEqual(one["entity_id"],two["entity_id"])
+        self.assertNotEqual(one["network_id"],two["network_id"])
+        observation_networks={row["network_id"] for row in self.store.db.execute("SELECT network_id FROM observations WHERE entity_id IN (%s,%s)",(one["entity_id"],two["entity_id"])).fetchall()}
+        self.assertEqual(observation_networks,{one["network_id"],two["network_id"]})
+        with self.assertRaises(self.psycopg.errors.ForeignKeyViolation):
+            self.store.db.execute("INSERT INTO observations(network_id,entity_id,observation_type,source_block_number,source_block_hash,source_transaction_hash,derived) VALUES(%s,%s,'cross-network',2,'0xnetwork-block-1911','0xnetwork-1911',TRUE)",
+                                  (one["network_id"],one["entity_id"]))
+
+    def test_receipt_log_provenance_and_multiple_logs(self):
+        from orbis.knowledge import KnowledgeService
+        sender,recipient,emitter="0x"+"2"*40,"0x"+"3"*40,"0x"+"4"*40
+        chain=1912; tx="0xprovtx"; blockhash="0xprovblock"
+        logs=[{"transactionHash":tx,"blockNumber":"0x1","blockHash":blockhash,"logIndex":hex(i),
+               "address":emitter,"topics":[],"data":"0x"} for i in range(3)]
+        self.store.commit_block(chain,{"number":"0x1","hash":blockhash,"parentHash":"0x0","timestamp":"0x1",
+            "transactions":[{"hash":tx,"from":sender,"to":recipient,"transactionIndex":"0x0"}]},
+            [{"transactionHash":tx,"blockNumber":"0x1","blockHash":blockhash,"status":"0x1","logs":logs}],[])
+        k=KnowledgeService(self.store); self.assertEqual(k.ingest(chain),1)
+        emitter_entity=k.get_entity(chain,emitter)
+        events=k.observations(chain,emitter)
+        self.assertEqual(len(events),3)
+        self.assertEqual({e["source_log_index"] for e in events},{0,1,2})
+        self.assertNotIn(emitter,{r["target_address"] for r in k.relationships(chain,sender)})
+        net=emitter_entity["network_id"]
+        observation=events[0]["observation_id"]
+        with self.assertRaises(self.psycopg.errors.ForeignKeyViolation):
+            self.store.db.execute("INSERT INTO evidence_refs(network_id,observation_id,block_number,block_hash,transaction_hash) VALUES(%s,%s,1,%s,'0xmissing-receipt')",
+                                  (net,observation,blockhash))
+        with self.assertRaises(self.psycopg.errors.ForeignKeyViolation):
+            self.store.db.execute("UPDATE receipts SET block_hash='0xwrong-block' WHERE network_id=%s AND transaction_hash=%s",(net,tx))
+        with self.assertRaises(self.psycopg.errors.ForeignKeyViolation):
+            self.store.db.execute("INSERT INTO evidence_refs(network_id,observation_id,block_number,block_hash,transaction_hash,log_index) VALUES(%s,%s,1,%s,%s,99)",
+                                  (net,observation,blockhash,tx))
+        tx_observation=k.observations(chain,sender)[0]
+        self.assertIsNone(self.store.db.execute("SELECT log_index FROM evidence_refs WHERE observation_id=%s",(tx_observation["observation_id"],)).fetchone()["log_index"])
+
+    def test_relationship_kinds_use_direct_recipient_and_valid_transfer_signature(self):
+        from orbis.knowledge import KnowledgeService
+        sender="0x"+"a1"*20; recipient="0x"+"a2"*20; other="0x"+"a3"*20; emitter="0x"+"a4"*20
+        chain=1914; blockhash="0xsem-block"
+        txs=[{"hash":"0xsem-direct","from":sender,"to":emitter,"transactionIndex":"0x0"},
+             {"hash":"0xsem-indirect","from":sender,"to":recipient,"transactionIndex":"0x1"}]
+        topic=lambda a:"0x"+"0"*24+a[2:]
+        transfer="0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+        emitter2="0x"+"a5"*20
+        logs=[{"transactionHash":"0xsem-direct","blockNumber":"0x1","blockHash":blockhash,"logIndex":"0x0","address":emitter,"topics":[],"data":"0x"},
+              {"transactionHash":"0xsem-indirect","blockNumber":"0x1","blockHash":blockhash,"logIndex":"0x1","address":emitter,"topics":[transfer,topic(sender),topic(other)],"data":"0x"+format(55,"064x")},
+              {"transactionHash":"0xsem-indirect","blockNumber":"0x1","blockHash":blockhash,"logIndex":"0x2","address":emitter,"topics":["0x"+"f"*64,topic(sender),topic(other)],"data":"0x"+format(56,"064x")},
+              {"transactionHash":"0xsem-indirect","blockNumber":"0x1","blockHash":blockhash,"logIndex":"0x3","address":emitter2,"topics":[],"data":"0x"}]
+        self.store.commit_block(chain,{"number":"0x1","hash":blockhash,"parentHash":"0x0","timestamp":"0x1","transactions":txs},
+            [{"transactionHash":t["hash"],"blockNumber":"0x1","blockHash":blockhash,"status":"0x1","logs":[l for l in logs if l["transactionHash"]==t["hash"]]} for t in txs],[])
+        k=KnowledgeService(self.store); self.assertEqual(k.ingest(chain),2)
+        rels=k.relationships(chain,sender)
+        typed={(r["relationship_type"],r["target_address"]) for r in rels}
+        self.assertIn(("interacted_with_contract",emitter),typed)
+        self.assertNotIn(("interacted_with_contract",recipient),typed)
+        self.assertIn(("transacted_with",recipient),typed)
+        self.assertIn(("transferred_to",other),typed)
+        transfer_observations=k.observations(chain,other)
+        self.assertEqual(len(transfer_observations),1)
+        self.assertEqual(transfer_observations[0]["payload"]["amount"],"55")
+        self.assertEqual(transfer_observations[0]["payload"]["token"],emitter)
+
+    def test_cross_network_relationship_endpoints_are_rejected(self):
+        from orbis.knowledge import KnowledgeService
+        addr1,addr2="0x"+"b1"*20,"0x"+"b2"*20
+        for chain,height in ((1915,1),(1916,2)):
+            tx=f"0xcross-{chain}"; blockhash=f"0xcross-block-{chain}"
+            self.store.commit_block(chain,{"number":hex(height),"hash":blockhash,"parentHash":"0xparent","timestamp":"0x1","transactions":[{"hash":tx,"from":addr1,"to":addr2,"transactionIndex":"0x0"}]},
+                [{"transactionHash":tx,"blockNumber":hex(height),"blockHash":blockhash,"status":"0x1","logs":[]}],[])
+            KnowledgeService(self.store).ingest(chain)
+        e1=KnowledgeService(self.store).get_entity(1915,addr1); e2=KnowledgeService(self.store).get_entity(1916,addr2)
+        with self.assertRaises(self.psycopg.errors.ForeignKeyViolation):
+            self.store.db.execute("INSERT INTO relationships(network_id,source_entity_id,relationship_type,target_entity_id,derivation,first_observed_block,last_observed_block) VALUES(%s,%s,'cross',%s,'observed',1,1)",
+                                  (e1["network_id"],e1["entity_id"],e2["entity_id"]))
+
+    def test_relationship_and_evidence_pages_are_bounded_and_ordered(self):
+        from orbis.knowledge import KnowledgeService
+        a,b="0x"+"5"*40,"0x"+"6"*40; chain=1913
+        self._knowledge_blocks(chain,1,5,a,b,"pages")
+        k=KnowledgeService(self.store); k.ingest(chain,10)
+        page1=k.relationships(chain,a,limit=1,offset=0)
+        page2=k.relationships(chain,a,limit=1,offset=1)
+        self.assertEqual(len(page1),1); self.assertEqual(len(page2),0)
+        evidence1=k.relationship_evidence(chain,page1[0]["relationship_id"],limit=2)
+        evidence2=k.relationship_evidence(chain,page1[0]["relationship_id"],limit=2,offset=2)
+        self.assertEqual((len(evidence1),len(evidence2)),(2,2))
+        plan=self.store.db.execute("EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) SELECT * FROM transactions WHERE network_id=%s AND sender=%s ORDER BY block_number DESC,tx_index DESC LIMIT 20",
+                                   (page1[0]["network_id"],a)).fetchall()
+        self.assertTrue(any("transaction_history_sender_idx" in row["QUERY PLAN"] for row in plan))
 
     def test_failed_block_write_does_not_advance_checkpoint(self):
         block = {"number": "0x2", "hash": "0xblock2", "parentHash": "0xparent", "timestamp": "0x10",

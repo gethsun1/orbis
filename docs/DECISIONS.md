@@ -1,6 +1,6 @@
 # ORBIS decisions and assumptions
 
-**Status:** M0 decision register. Owner clarification received 3 November 2026: the supplied PDF is approved as-is and is the source of truth; its draft wording was not updated. M1 may proceed against it. Recommendations below remain proposals unless identified as resolved.
+**Status:** Decision register. Owner clarification received 3 November 2026: the supplied PDF is approved as-is and is the source of truth; its draft wording was not updated. M3.1 evidence and status are recorded in the verification report.
 
 | ID | Topic | Current record | Status / owner |
 |---|---|---|---|
@@ -25,6 +25,7 @@
 | D-019 | M2 persistence implementation | PostgreSQL is the authoritative CLI target behind the observer persistence protocol, with ordered SQL migrations and an explicit SQLite development URL. PostgreSQL 18.6 runs on localhost; `orbis_app` owns separate dev/test databases and is not superuser. Migration, 7 PostgreSQL integration tests, 11 unit tests and bounded real Whitechain persistence passed. | Resolved for M2 / 3 Nov 2026 |
 | D-020 | M3 milestone interpretation | The current owner-authorized M3 brief prioritizes the evidence-backed knowledge layer and explicitly excludes the complete intelligence engine. The PRD's original deterministic-rules M3 gate is sequenced after knowledge review; no rule engine is claimed complete. | Resolved for current work / 3 Nov 2026 |
 | D-021 | Entity typing and address form | EVM address identity is lowercase 20-byte hex scoped by network; original spelling is retained. Transaction participants remain unknown until stronger evidence exists; an address emitting an indexed receipt log can be classified as a contract. No labels or ownership are inferred. | Implemented / M3 |
+| D-022 | M3.1 knowledge remediation | Relationship aggregates are recomputed from surviving canonical evidence during atomic suffix rollback. Enrichment uses a network-scoped durable completion ledger and deterministic row-locked pages. Receipt provenance is linked through transaction and block composite constraints without duplicating receipt payloads. PostgreSQL tests and final 150-block Whitechain Sepolia validation passed in an isolated schema; see both M3 reports. | Implemented / 4 Nov 2026 |
 
 ## Change discipline
 
