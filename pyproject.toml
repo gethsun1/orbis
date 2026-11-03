@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "orbis-intelligence"
+version = "0.1.0"
+description = "Whitechain-first, evidence-grounded on-chain intelligence infrastructure"
+requires-python = ">=3.11"
+dependencies = ["psycopg[binary]>=3.2,<4"]
+
+[project.scripts]
+orbis-index = "orbis.cli:main"
+orbis-db-migrate = "orbis.db_migrate:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
