@@ -6,14 +6,17 @@ import logging
 from typing import Any, Protocol
 
 from orbis.chain.rpc import RpcClient
+from orbis.network import NetworkContext, TrustState, verified_context
+
+
 class ObserverStore(Protocol):
     """Persistence boundary used by the indexer; implementations own atomic commits."""
 
-    def checkpoint(self, chain_id: int) -> tuple[int, str] | None: ...
-    def block_hash(self, chain_id: int, number: int) -> str | None: ...
-    def commit_block(self, chain_id: int, block: dict[str, Any], receipts: list[dict[str, Any]],
+    def checkpoint(self, context: NetworkContext) -> tuple[int, str] | None: ...
+    def block_hash(self, context: NetworkContext, number: int) -> str | None: ...
+    def commit_block(self, context: NetworkContext, block: dict[str, Any], receipts: list[dict[str, Any]],
                      logs: list[dict[str, Any]]) -> None: ...
-    def rollback_from(self, chain_id: int, number: int) -> None: ...
+    def rollback_from(self, context: NetworkContext, number: int) -> None: ...
 
 logger = logging.getLogger(__name__)
 
@@ -24,6 +27,7 @@ class Indexer:
         self.rpc = rpc
         self.store = store
         self.chain_id = chain_id
+        self.network_context: NetworkContext | None = None
         self.confirmation_depth = confirmation_depth
         self.batch_size = batch_size
 
@@ -31,32 +35,53 @@ class Indexer:
         actual = self.rpc.chain_id()
         if actual != self.chain_id:
             raise ValueError(f"Configured chain ID {self.chain_id} does not match RPC chain ID {actual}")
+        # This verification runs before the first checkpoint lookup or write.
+        self.network_context = verified_context(actual, self.rpc.genesis_hash())
         head = self.rpc.block_number()
-        return {"chain_id": actual, "head_block": head, "provider_status": "healthy"}
+        return {"chain_id": actual, "head_block": head, "provider_status": "healthy",
+                "network_fingerprint": self.network_context.network_fingerprint}
 
     def _repair_checkpoint(self, checkpoint: tuple[int, str]) -> tuple[int, str] | None:
+        network = self._store_network()
         number, expected_hash = checkpoint
         remote = self.rpc.block(number)
         if remote and remote.get("hash", "").lower() == expected_hash.lower():
             return checkpoint
         logger.warning("Reorg detected at checkpoint %s", number)
         ancestor = self._common_ancestor(number - 1)
-        self.store.rollback_from(self.chain_id, ancestor + 1)
-        return self.store.checkpoint(self.chain_id)
+        self.store.rollback_from(network, ancestor + 1)
+        return self.store.checkpoint(network)
 
     def _common_ancestor(self, from_number: int) -> int:
+        network = self._store_network()
         for number in range(from_number, -1, -1):
-            local_hash = self.store.block_hash(self.chain_id, number)
+            local_hash = self.store.block_hash(network, number)
             remote = self.rpc.block(number)
             if local_hash and remote and local_hash.lower() == remote.get("hash", "").lower():
                 return number
         return -1
 
+    def _store_network(self):
+        if self.network_context is None:
+            raise RuntimeError("network context has not been verified")
+        if getattr(self.store, "supports_unresolved_single_profile", False):
+            return self.chain_id
+        if self.network_context.state is not TrustState.TRUSTED:
+            raise RuntimeError("network context has not been resolved")
+        return self.network_context
+
     def sync(self, start_block: int | None = None, end_block: int | None = None) -> dict[str, int]:
         network = self.verify_network()
+        if self.network_context is None or self.network_context.state is TrustState.UNTRUSTED:
+            raise ValueError("network identity has not been verified")
+        if not getattr(self.store, "supports_unresolved_single_profile", False):
+            if not callable(getattr(self.store, "resolve_network", None)):
+                raise RuntimeError("registry-backed store lacks exact NetworkContext resolution")
+            self.network_context = self.store.resolve_network(self.network_context)
+        network_context = self._store_network()
         safe_head = max(0, network["head_block"] - self.confirmation_depth)
         target = min(safe_head, end_block) if end_block is not None else safe_head
-        checkpoint = self.store.checkpoint(self.chain_id)
+        checkpoint = self.store.checkpoint(network_context)
         if checkpoint:
             checkpoint = self._repair_checkpoint(checkpoint)
         if checkpoint:
@@ -76,14 +101,14 @@ class Indexer:
                 if block is None:
                     raise RuntimeError(f"RPC returned no block for height {number}")
                 self._validate_block(block, number)
-                prior = self.store.checkpoint(self.chain_id)
+                prior = self.store.checkpoint(network_context)
                 if prior and block.get("parentHash", "").lower() != prior[1].lower():
                     # Discard the forked suffix and replay this height.
                     ancestor = self._common_ancestor(prior[0])
                     if ancestor < 0:
                         raise RuntimeError(f"No common ancestor found before block {number}; refusing cursor advance")
-                    self.store.rollback_from(self.chain_id, ancestor + 1)
-                    prior = self.store.checkpoint(self.chain_id)
+                    self.store.rollback_from(network_context, ancestor + 1)
+                    prior = self.store.checkpoint(network_context)
                     if prior and block.get("parentHash", "").lower() != prior[1].lower():
                         raise RuntimeError(f"Cannot find canonical parent for block {number}; refusing cursor advance")
                 transactions = block.get("transactions", [])
@@ -97,11 +122,11 @@ class Indexer:
                     self._validate_receipt(receipt, tx, block, number)
                     receipts.append(receipt)
                 # Block facts, transactions, receipt logs and checkpoint commit atomically.
-                self.store.commit_block(self.chain_id, block, receipts, [])
+                self.store.commit_block(network_context, block, receipts, [])
                 processed += 1
                 logger.info("Indexed block %s (%s transactions)", number, len(transactions))
             next_block = batch_end + 1
-        checkpoint = self.store.checkpoint(self.chain_id)
+        checkpoint = self.store.checkpoint(network_context)
         return {"chain_id": self.chain_id, "head_block": network["head_block"],
                 "provider_status": network["provider_status"],
                 "safe_head": safe_head, "indexed_blocks": processed,

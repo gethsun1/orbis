@@ -24,8 +24,8 @@ def main() -> None:
                               network_environment=settings.network_environment,
                               provider_name=settings.provider_name)
     try:
-        if hasattr(store, "migrate"):
-            store.migrate()
+        if hasattr(store, "check_compatibility"):
+            store.check_compatibility()
         result = Indexer(rpc, store, settings.chain_id, settings.confirmation_depth,
                          settings.batch_size).sync(start_block=settings.start_block)
         print(json.dumps(result, sort_keys=True))

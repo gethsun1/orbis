@@ -6,6 +6,7 @@ from tempfile import TemporaryDirectory
 
 from orbis.observer.indexer import Indexer
 from orbis.observer.store import SqliteStore
+from orbis.network import TrustState
 
 
 def hx(value: int) -> str:
@@ -29,6 +30,9 @@ class FakeRpc:
     def block_number(self):
         return max(self.blocks)
 
+    def genesis_hash(self):
+        return "0x" + "ab" * 32
+
     def block(self, number):
         return self.blocks.get(number)
 
@@ -50,6 +54,7 @@ class ObserverTests(unittest.TestCase):
         indexer = Indexer(rpc, self.store, 1874, confirmation_depth=0, batch_size=1)
         result = indexer.sync(start_block=0)
         self.assertEqual(result["indexed_blocks"], 2)
+        self.assertEqual(indexer.network_context.state, TrustState.UNRESOLVED)
         self.assertEqual(result["provider_status"], "healthy")
         self.assertEqual(self.store.checkpoint(1874), (1, one["hash"]))
         self.assertEqual(self.store.count("blocks", 1874), 2)
@@ -61,6 +66,15 @@ class ObserverTests(unittest.TestCase):
         rpc = FakeRpc({0: make_block(0, "0x00")}, chain_id=2625)
         with self.assertRaisesRegex(ValueError, "does not match"):
             Indexer(rpc, self.store, 1874).sync(start_block=0)
+
+    def test_refuses_registry_backed_operations_without_exact_resolution(self):
+        class RegistryRequiredStore:
+            def checkpoint(self, chain_id):
+                raise AssertionError("must refuse before selecting a checkpoint")
+
+        rpc = FakeRpc({0: make_block(0, "0x00")})
+        with self.assertRaisesRegex(RuntimeError, "lacks exact NetworkContext resolution"):
+            Indexer(rpc, RegistryRequiredStore(), 1874).sync(start_block=0)
 
     def test_does_not_advance_checkpoint_when_receipt_is_missing(self):
         genesis = make_block(0, "0x00")

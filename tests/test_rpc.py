@@ -46,6 +46,29 @@ class RpcClientTests(unittest.TestCase):
             self.assertEqual(request.call_count, 1)
             self.assertNotIn("secret", str(error.exception))
 
+    def test_reads_and_normalizes_genesis_identity(self):
+        block = {"number": "0x0", "hash": "0x" + "AB" * 32}
+        with patch("urllib.request.urlopen", return_value=Response({"jsonrpc": "2.0", "id": 1,
+                                                                      "result": block})):
+            self.assertEqual(RpcClient("https://rpc.example").genesis_hash(), "0x" + "ab" * 32)
+
+    def test_rejects_invalid_genesis_identity_without_echoing_rpc_value(self):
+        for block in (None, {"number": "0x1", "hash": "0x" + "ab" * 32},
+                      {"number": "0x0", "hash": "bad-secret"}):
+            with self.subTest(block=block), patch("urllib.request.urlopen",
+                    return_value=Response({"jsonrpc": "2.0", "id": 1, "result": block})):
+                with self.assertRaises(RpcError) as error:
+                    RpcClient("https://rpc.example").genesis_hash()
+                self.assertNotIn("bad-secret", str(error.exception))
+
+    def test_rpc_provider_error_text_is_not_exposed(self):
+        payload = {"jsonrpc": "2.0", "id": 1,
+                   "error": {"code": -32000, "message": "failed https://rpc/key-secret"}}
+        with patch("urllib.request.urlopen", return_value=Response(payload)):
+            with self.assertRaises(RpcError) as error:
+                RpcClient("https://rpc.example").chain_id()
+        self.assertNotIn("key-secret", str(error.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

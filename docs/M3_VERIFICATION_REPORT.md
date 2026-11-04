@@ -5,7 +5,7 @@
 
 ## Scope and outcome
 
-This remediation follows the owner-authorized M3 Knowledge Layer brief and the independent M3 audit. It preserves the approved PRD's milestone requirements and records the authorized sequencing change in D-020: the knowledge layer is reviewed before the PRD's deterministic intelligence rules. No M4 intelligence, AI/LLM, MeTTa, REST, SDK, MCP, dashboard, deployment, or full historical synchronization work was started.
+This remediation follows the owner-authorized M3 Knowledge Layer brief and the independent M3 audit. It preserves the approved PRD's milestone requirements and records the sequencing change in D-020/D-023: the knowledge layer is implementation M3 and deterministic intelligence is implementation M4. The definitive M4 contracts are in [M4 specification](M4_SPECIFICATION.md). No M4 implementation, AI/LLM, MeTTa, REST, SDK, MCP, dashboard, deployment, or full historical synchronization work was started.
 
 The verified M3.1 defects were addressed across R1–R6. PostgreSQL migrations and the complete test suite passed. A separate final live validation then used the explicitly configured Whitechain Sepolia endpoint and an isolated PostgreSQL schema; see the live report for current RPC health, range hashes, counts, restart, enrichment, and transaction evidence.
 
@@ -66,7 +66,7 @@ This is 11 unit/regression tests and 20 PostgreSQL integration tests. PostgreSQL
 
 The ignored local `.env` contains the explicitly configured `https://rpc.testnet.whitechain.io/` endpoint and chain ID 1874. The endpoint passed the 4 November live validation; no endpoint substitution occurred. The earlier M1 report's HTTP 403 result is retained as historical evidence because endpoint availability may vary.
 
-The enrichment service remains an internal service with no CLI/API entry point. ERC-20 is the only decoded event. Relationship aggregation counts distinct supporting transactions, not log count. The local query plan does not establish throughput or production readiness. Deterministic intelligence rules remain deferred to the later PRD gate; they are not implemented here.
+The enrichment service remains an internal service with no CLI/API entry point. ERC-20 is the only decoded event. Relationship aggregation counts distinct supporting transactions, not log count. The local query plan does not establish throughput or production readiness. Deterministic intelligence rules are sequenced to implementation M4; they are not implemented here.
 
 ## Acceptance verdict
 

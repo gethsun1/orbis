@@ -8,9 +8,9 @@ from orbis.observer.postgres import PostgresStore
 
 
 def main() -> None:
-    dsn = os.environ.get("ORBIS_DATABASE_URL", "").strip()
+    dsn = os.environ.get("ORBIS_MIGRATION_DATABASE_URL", "").strip()
     if not dsn:
-        raise ValueError("ORBIS_DATABASE_URL must be set")
+        raise ValueError("ORBIS_MIGRATION_DATABASE_URL must be set; migrations use a separate principal from runtime")
     store = PostgresStore(dsn)
     try:
         store.migrate()

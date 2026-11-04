@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -10,6 +11,7 @@ from uuid import uuid4
 import psycopg
 from psycopg.rows import dict_row
 from orbis.observer.integrity import validate_block_transactions
+from orbis.network import NetworkContext, TrustState, resolved_context
 
 
 class PostgresStore:
@@ -30,37 +32,78 @@ class PostgresStore:
 
     def migrate(self) -> None:
         with self.db.transaction():
-            self.db.execute("CREATE TABLE IF NOT EXISTS schema_migrations (version TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())")
+            self.db.execute("CREATE TABLE IF NOT EXISTS schema_migrations (version TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now(), checksum TEXT)")
+            self.db.execute("ALTER TABLE schema_migrations ADD COLUMN IF NOT EXISTS checksum TEXT")
             for path in sorted(self.migration_dir.glob("*.sql")):
-                found = self.db.execute("SELECT 1 FROM schema_migrations WHERE version=%s", (path.name,)).fetchone()
+                checksum = hashlib.sha256(path.read_bytes()).hexdigest()
+                found = self.db.execute("SELECT checksum FROM schema_migrations WHERE version=%s", (path.name,)).fetchone()
                 if found:
+                    if found["checksum"] is not None and found["checksum"] != checksum:
+                        raise RuntimeError(f"migration checksum mismatch: {path.name}")
+                    self.db.execute("UPDATE schema_migrations SET checksum=%s WHERE version=%s AND checksum IS NULL",
+                                    (checksum,path.name))
                     continue
                 self.db.execute(path.read_text())
-                self.db.execute("INSERT INTO schema_migrations(version) VALUES (%s)", (path.name,))
+                self.db.execute("INSERT INTO schema_migrations(version,checksum) VALUES (%s,%s)", (path.name,checksum))
 
-    def _network_id(self, chain_id: int) -> int:
-        row = self.db.execute("""INSERT INTO networks(chain_id,name,environment,provider_name)
-            VALUES (%s,%s,COALESCE(NULLIF(%s,''),'unknown'),%s) ON CONFLICT(chain_id) DO UPDATE SET
-            name=CASE WHEN EXCLUDED.name<>'' THEN EXCLUDED.name ELSE networks.name END,
-            environment=CASE WHEN EXCLUDED.environment<>'unknown' THEN EXCLUDED.environment ELSE networks.environment END,
-            provider_name=CASE WHEN EXCLUDED.provider_name<>'' THEN EXCLUDED.provider_name ELSE networks.provider_name END
-            RETURNING network_id""",
-            (chain_id, self.network_name, self.network_environment, self.provider_name)).fetchone()
-        return int(row["network_id"])
+    def check_compatibility(self) -> None:
+        """Reject old, partial, or unmigrated schemas before any network operation."""
+        if not self.db.execute("SELECT to_regclass('schema_migrations') AS relation").fetchone()["relation"]:
+            raise RuntimeError("database schema is not migrated; run orbis-db-migrate with the migration principal")
+        expected = [p.name for p in sorted(self.migration_dir.glob("*.sql"))]
+        rows = self.db.execute("SELECT version,checksum FROM schema_migrations ORDER BY version").fetchall()
+        actual = [r["version"] for r in rows]
+        if actual != expected:
+            raise RuntimeError("unsupported or partial database schema; runtime requires the complete migration set")
+        by_name = {r["version"]:r["checksum"] for r in rows}
+        for path in sorted(self.migration_dir.glob("*.sql")):
+            if by_name[path.name] != hashlib.sha256(path.read_bytes()).hexdigest():
+                raise RuntimeError(f"migration checksum mismatch: {path.name}")
+        columns = {r["column_name"] for r in self.db.execute(
+            "SELECT column_name FROM information_schema.columns WHERE table_schema=current_schema() AND table_name='networks'").fetchall()}
+        if not {"fingerprint_scheme", "network_fingerprint", "genesis_hash"} <= columns:
+            raise RuntimeError("database lacks network identity capability")
 
-    def checkpoint(self, chain_id: int) -> tuple[int, str] | None:
-        row = self.db.execute("SELECT c.block_number,c.block_hash FROM checkpoints c JOIN networks n USING(network_id) WHERE n.chain_id=%s", (chain_id,)).fetchone()
+    def resolve_network(self, context: NetworkContext) -> NetworkContext:
+        if context.state is not TrustState.UNRESOLVED:
+            raise ValueError("registry resolution requires verified RPC context")
+        with self.db.transaction():
+            self.db.execute("""INSERT INTO networks(chain_id,name,environment,provider_name,
+                fingerprint_scheme,network_fingerprint,genesis_hash)
+                VALUES (%s,%s,COALESCE(NULLIF(%s,''),'unknown'),%s,%s,%s,%s)
+                ON CONFLICT (chain_id,fingerprint_scheme,network_fingerprint)
+                WHERE network_fingerprint IS NOT NULL DO NOTHING""",
+                (context.chain_id,self.network_name,self.network_environment,self.provider_name,
+                 context.fingerprint_scheme,context.network_fingerprint,context.genesis_hash))
+            row = self.db.execute("""SELECT network_id,chain_id,fingerprint_scheme,
+                network_fingerprint,genesis_hash FROM networks WHERE chain_id=%s
+                AND fingerprint_scheme=%s AND network_fingerprint=%s FOR KEY SHARE""",
+                (context.chain_id,context.fingerprint_scheme,context.network_fingerprint)).fetchone()
+            if not row:
+                raise LookupError("verified network identity could not be registered")
+            return resolved_context(context,int(row["network_id"]),stored_chain_id=row["chain_id"],
+                stored_scheme=row["fingerprint_scheme"],stored_fingerprint=row["network_fingerprint"],
+                stored_genesis_hash=row["genesis_hash"])
+
+    @staticmethod
+    def _network_id(context: NetworkContext) -> int:
+        if not isinstance(context, NetworkContext) or context.state is not TrustState.TRUSTED or not context.network_id:
+            raise ValueError("network operation requires an exactly resolved NetworkContext")
+        return context.network_id
+
+    def checkpoint(self, context: NetworkContext) -> tuple[int, str] | None:
+        row = self.db.execute("SELECT block_number,block_hash FROM checkpoints WHERE network_id=%s", (self._network_id(context),)).fetchone()
         return (row["block_number"], row["block_hash"]) if row else None
 
-    def block_hash(self, chain_id: int, number: int) -> str | None:
-        row = self.db.execute("SELECT b.hash FROM blocks b JOIN networks n USING(network_id) WHERE n.chain_id=%s AND b.number=%s AND b.canonical", (chain_id, number)).fetchone()
+    def block_hash(self, context: NetworkContext, number: int) -> str | None:
+        row = self.db.execute("SELECT hash FROM blocks WHERE network_id=%s AND number=%s AND canonical", (self._network_id(context), number)).fetchone()
         return row["hash"] if row else None
 
-    def commit_block(self, chain_id: int, block: dict[str, Any], receipts: list[dict[str, Any]], logs: list[dict[str, Any]]) -> None:
+    def commit_block(self, context: NetworkContext, block: dict[str, Any], receipts: list[dict[str, Any]], logs: list[dict[str, Any]]) -> None:
         validate_block_transactions(block)
         number = int(block["number"], 16)
         with self.db.transaction():
-            network_id = self._network_id(chain_id)
+            network_id = self._network_id(context)
             # A canonical height has one block. Evidence references restrict removal of source
             # data; the deferred checkpoint FK permits safe replacement before cursor update.
             self.db.execute("DELETE FROM blocks WHERE network_id=%s AND number=%s AND hash<>%s", (network_id, number, block["hash"]))
@@ -97,12 +140,9 @@ class PostgresStore:
                 block_number=EXCLUDED.block_number,block_hash=EXCLUDED.block_hash
                 WHERE checkpoints.block_number <= EXCLUDED.block_number""", (network_id, number, block["hash"]))
 
-    def rollback_from(self, chain_id: int, number: int) -> None:
+    def rollback_from(self, context: NetworkContext, number: int) -> None:
         with self.db.transaction():
-            row = self.db.execute("SELECT network_id FROM networks WHERE chain_id=%s", (chain_id,)).fetchone()
-            if not row:
-                return
-            network_id = row["network_id"]
+            network_id = self._network_id(context)
             self._invalidate_m4_for_suffix(network_id, number, str(uuid4()), "canonical suffix rollback")
             # Retract derived knowledge before deleting its source suffix. Replayed
             # canonical records will be enriched again by the independent pipeline.
@@ -175,10 +215,10 @@ class PostgresStore:
                     (network_id,evaluation_id,json.dumps([r["finding_id"] for r in finding_ids]),number,
                      json.dumps([r["block_hash"] for r in eval_hashes]),reason,changed["invalidated_at"],rollback_id))
 
-    def count(self, table: str, chain_id: int) -> int:
+    def count(self, table: str, context: NetworkContext) -> int:
         if table not in {"blocks", "transactions", "receipts", "logs"}:
             raise ValueError("unsupported table")
-        row = self.db.execute(f"SELECT count(*) AS n FROM {table} t JOIN networks n USING(network_id) WHERE n.chain_id=%s", (chain_id,)).fetchone()
+        row = self.db.execute(f"SELECT count(*) AS n FROM {table} WHERE network_id=%s", (self._network_id(context),)).fetchone()
         return int(row["n"])
 
     def close(self) -> None:

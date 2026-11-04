@@ -17,6 +17,30 @@ class RuleInfrastructureTests(unittest.TestCase):
         self.assertEqual(evaluation_identity(**kwargs),evaluation_identity(**kwargs))
         self.assertNotEqual(evaluation_identity(**kwargs),evaluation_identity(**{**kwargs,"to_block":3}))
 
+    def test_v1_characterizes_same_chain_id_network_fingerprint_collision(self):
+        """v1 currently ignores network fingerprints; preserve this reproducer until v2 replaces it."""
+        common=dict(chain_id=1874,subject_kind="address",subject_key="0x"+"ab"*20,
+            rule_id="D-01",semantic_version="1.0.0",definition_digest=digest({"rule":1}),
+            from_block=1,to_block=2,parameters={},context_digest=digest({"shared_context":True}),evaluator_build="build")
+        network_a={"chain_id":1874,"genesis_hash":"0x"+"11"*32}
+        network_b={"chain_id":1874,"genesis_hash":"0x"+"22"*32}
+        # Each identity is passed as the current API's only network field. Since
+        # both networks have the same chain ID, v1 emits the same key despite
+        # their distinct canonical genesis hashes.
+        self.assertNotEqual(network_a["genesis_hash"],network_b["genesis_hash"])
+        key_a=evaluation_identity(**{**common,"chain_id":network_a["chain_id"]})
+        key_b=evaluation_identity(**{**common,"chain_id":network_b["chain_id"]})
+        self.assertEqual(key_a,key_b)
+
+    def test_v2_distinguishes_networks_sharing_chain_id(self):
+        """Portable v2 identity separates networks sharing one chain ID."""
+        common=dict(chain_id=1874,subject_kind="address",subject_key="0x"+"ab"*20,
+            rule_id="D-01",semantic_version="1.0.0",definition_digest=digest({"rule":1}),
+            from_block=1,to_block=2,parameters={},context_digest=digest({"shared_context":True}),evaluator_build="build")
+        first=evaluation_identity(**common,network_fingerprint="genesis:0x"+"11"*32)
+        second=evaluation_identity(**common,network_fingerprint="genesis:0x"+"22"*32)
+        self.assertNotEqual(first,second)
+
     def test_decimal_null_omitted_and_set_behavior(self):
         schema={"properties":{"ratio":{"type":"number"},"optional":{}}}
         self.assertEqual(normalize_parameters({"ratio":Decimal("1.2500"),"optional":None},schema),{"ratio":"1.25","optional":None})

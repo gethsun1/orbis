@@ -4,15 +4,22 @@ from datetime import datetime, timezone
 from psycopg.types.json import Jsonb
 from .evidence import verify_envelope
 from .normalization import digest
+from orbis.network import NetworkContext, TrustState
 
 
 class EvaluationRepository:
     def __init__(self, connection): self.db = connection
 
-    def _verify_request(self, *, network_id, rule_version, from_block, to_block, parameters,
+    def _verify_request(self, *, context, network_id, rule_version, from_block, to_block, parameters,
                         context_digest, evaluator_build, envelope):
-        row = self.db.execute("SELECT chain_id FROM networks WHERE network_id=%s",(network_id,)).fetchone()
+        if (not isinstance(context, NetworkContext) or context.state is not TrustState.TRUSTED
+                or context.network_id != network_id):
+            raise ValueError("rules request requires its exactly resolved NetworkContext")
+        row = self.db.execute("SELECT chain_id,fingerprint_scheme,network_fingerprint,genesis_hash FROM networks WHERE network_id=%s",(network_id,)).fetchone()
         if row is None: raise LookupError("network not found")
+        if (row["chain_id"],row["fingerprint_scheme"],row["network_fingerprint"],row["genesis_hash"]) != (
+                context.chain_id,context.fingerprint_scheme,context.network_fingerprint,context.genesis_hash):
+            raise ValueError("rules NetworkContext does not match registered identity")
         if envelope.get("network_chain_id") != row["chain_id"]: raise ValueError("evidence network does not match evaluation network")
         if envelope.get("bounds") != {"from":from_block,"to":to_block}: raise ValueError("evidence bounds do not match evaluation bounds")
         if envelope.get("parameters") != parameters: raise ValueError("evidence parameters do not match evaluation parameters")
@@ -30,7 +37,7 @@ class EvaluationRepository:
             canonical={(r["number"],r["hash"]) for r in source}
             if canonical != identities: raise ValueError("evaluation evidence is not backed by canonical source blocks")
 
-    def create(self, *, network_id, rule_version, subject_kind, subject_key, from_block, to_block,
+    def create(self, *, context, network_id, rule_version, subject_kind, subject_key, from_block, to_block,
                parameters, context_digest, evaluator_build, evaluation_key, coverage, envelope,
                outcome, findings=(), diagnostics=None, supersedes_evaluation_id=None):
         verify_envelope(envelope)
@@ -41,7 +48,7 @@ class EvaluationRepository:
         parameter_digest = digest(parameters)
         now = datetime.now(timezone.utc)
         with self.db.transaction():
-            self._verify_request(network_id=network_id,rule_version=rule_version,from_block=from_block,to_block=to_block,
+            self._verify_request(context=context,network_id=network_id,rule_version=rule_version,from_block=from_block,to_block=to_block,
                 parameters=parameters,context_digest=context_digest,evaluator_build=evaluator_build,envelope=envelope)
             row = self.db.execute("""INSERT INTO evaluations(network_id,rule_version_id,rule_id,subject_kind,subject_key,
                 from_block,to_block,normalized_parameters,parameter_digest,context_digest,evaluator_build,evaluation_key,
@@ -79,13 +86,13 @@ class EvaluationRepository:
                             (network_id,found["finding_id"],ordinal,canonical["evidence_digest"],canonical["source_kind"],canonical["block_number"],canonical["block_hash"],canonical.get("transaction_hash"),canonical.get("log_index"),Jsonb(canonical["normalized_input"]),"sha256",canonical["schema_version"]))
             return row
 
-    def record_failure(self, *, network_id, rule_version, subject_kind, subject_key, from_block, to_block,
+    def record_failure(self, *, context, network_id, rule_version, subject_kind, subject_key, from_block, to_block,
                        parameters, context_digest, evaluator_build, evaluation_key, coverage, envelope,
                        diagnostics, attempt_no=1):
         verify_envelope(envelope)
         now=datetime.now(timezone.utc)
         with self.db.transaction():
-            self._verify_request(network_id=network_id,rule_version=rule_version,from_block=from_block,to_block=to_block,
+            self._verify_request(context=context,network_id=network_id,rule_version=rule_version,from_block=from_block,to_block=to_block,
                 parameters=parameters,context_digest=context_digest,evaluator_build=evaluator_build,envelope=envelope)
             row=self.db.execute("""INSERT INTO evaluations(network_id,rule_version_id,rule_id,subject_kind,subject_key,
                 from_block,to_block,normalized_parameters,parameter_digest,context_digest,evaluator_build,evaluation_key,
@@ -103,7 +110,16 @@ class EvaluationRepository:
             self.db.execute("INSERT INTO evaluation_attempts VALUES(%s,%s,%s,'failed',%s,%s,%s)",(network_id,row["evaluation_id"],attempt_no,Jsonb(diagnostics),now,now))
             return row
 
-    def get(self, network_id, evaluation_id):
+    def get(self, context, evaluation_id):
+        if not isinstance(context, NetworkContext) or context.state is not TrustState.TRUSTED or not context.network_id:
+            raise ValueError("rules retrieval requires an exactly resolved NetworkContext")
+        network_id = context.network_id
+        registered = self.db.execute("""SELECT chain_id,fingerprint_scheme,network_fingerprint,genesis_hash
+            FROM networks WHERE network_id=%s""", (network_id,)).fetchone()
+        if registered is None or (registered["chain_id"],registered["fingerprint_scheme"],
+                registered["network_fingerprint"],registered["genesis_hash"]) != (
+                context.chain_id,context.fingerprint_scheme,context.network_fingerprint,context.genesis_hash):
+            raise ValueError("rules retrieval context does not match registered identity")
         row=self.db.execute("SELECT * FROM evaluations WHERE network_id=%s AND evaluation_id=%s",(network_id,evaluation_id)).fetchone()
         if row is None: raise LookupError("evaluation not found")
         verify_envelope(row["evidence_envelope"])

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import random
+import re
 import time
 import urllib.error
 import urllib.request
@@ -43,7 +44,7 @@ class RpcClient:
                     body = json.loads(response.read())
                 if body.get("error"):
                     error = body["error"]
-                    message = str(error.get("message", ""))
+                    message = str(error.get("message", "")) if isinstance(error, dict) else ""
                     if attempt < self.max_retries and any(term in message.lower() for term in
                             ("rate limit", "too many requests", "temporarily unavailable")):
                         delay = min(30.0, 0.25 * (2 ** attempt) + random.uniform(0, 0.2))
@@ -52,7 +53,8 @@ class RpcClient:
                                                                               "delay_seconds": delay})
                         time.sleep(delay)
                         continue
-                    raise RpcError(f"{method} RPC error {error.get('code')}: {error.get('message')}")
+                    code = error.get("code") if isinstance(error, dict) else "unknown"
+                    raise RpcError(f"{method} RPC error {code}")
                 if "result" not in body:
                     raise RpcError(f"{method} response is missing result")
                 return body["result"]
@@ -75,9 +77,9 @@ class RpcClient:
 
     @staticmethod
     def quantity(value: str) -> int:
-        if not isinstance(value, str) or not value.startswith("0x"):
-            raise RpcError(f"Invalid Ethereum quantity: {value!r}")
-        return int(value, 16)
+        if not isinstance(value, str) or re.fullmatch(r"0x[0-9a-fA-F]+", value) is None:
+            raise RpcError("Invalid Ethereum quantity")
+        return int(value[2:], 16)
 
     def chain_id(self) -> int:
         return self.quantity(self.call("eth_chainId"))
@@ -87,6 +89,21 @@ class RpcClient:
 
     def block(self, number: int) -> dict[str, Any] | None:
         return self.call("eth_getBlockByNumber", [hex(number), True])
+
+    def genesis_hash(self) -> str:
+        from orbis.network import normalize_genesis_hash
+
+        block = self.call("eth_getBlockByNumber", ["0x0", False])
+        if not isinstance(block, dict):
+            raise RpcError("eth_getBlockByNumber returned invalid genesis block")
+        try:
+            number = self.quantity(block.get("number"))
+            genesis_hash = normalize_genesis_hash(block.get("hash"))
+        except (TypeError, ValueError) as exc:
+            raise RpcError("eth_getBlockByNumber returned invalid genesis identity") from exc
+        if number != 0:
+            raise RpcError("eth_getBlockByNumber returned a non-zero genesis height")
+        return genesis_hash
 
     def receipt(self, tx_hash: str) -> dict[str, Any] | None:
         return self.call("eth_getTransactionReceipt", [tx_hash])

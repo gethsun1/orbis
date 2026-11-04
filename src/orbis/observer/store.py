@@ -12,6 +12,8 @@ from orbis.observer.integrity import validate_block_transactions
 class SqliteStore:
     """SQLite is the M1 single-node checkpoint/evidence store, not a scale target."""
 
+    supports_unresolved_single_profile = True
+
     def __init__(self, path: str) -> None:
         if path != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True)
