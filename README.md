@@ -67,6 +67,3 @@ The indexer processes only through `head - ORBIS_CONFIRMATION_DEPTH`. `ORBIS_BAT
 - Reorg replay uses stored block hashes to find a common ancestor. Its confirmation-depth policy needs calibration against verified Whitechain finality behavior.
 - This is not a production-ready service. Authentication, REST API, metrics and deployment are later milestones. Local backup/restore commands are documented; production retention and recovery procedures still need deployment-specific validation.
 
-## Local documentation
-
-The workspace's `docs/` directory is intentionally excluded from version control. Repository behavior and setup instructions are summarized here; local milestone notes and reports stay in the working copy.
