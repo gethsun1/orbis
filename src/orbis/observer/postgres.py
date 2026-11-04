@@ -9,26 +9,35 @@ from typing import Any
 from uuid import uuid4
 
 import psycopg
+from psycopg.conninfo import conninfo_to_dict
 from psycopg.rows import dict_row
 from orbis.observer.integrity import validate_block_transactions
 from orbis.network import NetworkContext, TrustState, resolved_context
+from orbis.deployment import acquire_runtime_lock
 
 
 class PostgresStore:
     """Authoritative observer store. Each block and cursor update share a transaction."""
 
     def __init__(self, dsn: str, migration_dir: str | Path | None = None, schema: str | None = None,
-                 network_name: str = "", network_environment: str = "", provider_name: str = "") -> None:
+                 network_name: str = "", network_environment: str = "", provider_name: str = "",
+                 runtime_fenced: bool = True) -> None:
         self.db = psycopg.connect(dsn, row_factory=dict_row, autocommit=True)
         self.network_name = network_name
         self.network_environment = network_environment
         self.provider_name = provider_name
         if schema:
-            # Identifiers cannot be bound as values; quote via psycopg's Identifier.
+            # Runtime connection setup must never create schema objects.
             from psycopg import sql
-            self.db.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(sql.Identifier(schema)))
             self.db.execute(sql.SQL("SET search_path TO {}").format(sql.Identifier(schema)))
         self.migration_dir = Path(migration_dir) if migration_dir else Path(__file__).resolve().parents[3] / "migrations"
+        self.runtime_fenced = runtime_fenced
+        if runtime_fenced:
+            try:
+                acquire_runtime_lock(self.db)
+            except Exception:
+                self.db.close()
+                raise
 
     def migrate(self) -> None:
         with self.db.transaction():
@@ -48,15 +57,25 @@ class PostgresStore:
 
     def check_compatibility(self) -> None:
         """Reject old, partial, or unmigrated schemas before any network operation."""
+        from orbis.schema_policy import (
+            MAXIMUM_SCHEMA_VERSION, MINIMUM_SCHEMA_VERSION, OPTIONAL_COMPATIBLE_MIGRATIONS,
+        )
         if not self.db.execute("SELECT to_regclass('schema_migrations') AS relation").fetchone()["relation"]:
             raise RuntimeError("database schema is not migrated; run orbis-db-migrate with the migration principal")
         expected = [p.name for p in sorted(self.migration_dir.glob("*.sql"))]
+        if not expected or expected[-1] != MAXIMUM_SCHEMA_VERSION:
+            raise RuntimeError("runtime migration bundle is outside its declared schema support window")
         rows = self.db.execute("SELECT version,checksum FROM schema_migrations ORDER BY version").fetchall()
         actual = [r["version"] for r in rows]
-        if actual != expected:
+        required = set(expected) - OPTIONAL_COMPATIBLE_MIGRATIONS
+        if not required.issubset(actual) or set(actual) - set(expected):
             raise RuntimeError("unsupported or partial database schema; runtime requires the complete migration set")
+        if not actual or actual[-1] < MINIMUM_SCHEMA_VERSION or actual[-1] > MAXIMUM_SCHEMA_VERSION:
+            raise RuntimeError("database schema is outside the runtime's declared support window")
         by_name = {r["version"]:r["checksum"] for r in rows}
         for path in sorted(self.migration_dir.glob("*.sql")):
+            if path.name not in by_name:
+                continue
             if by_name[path.name] != hashlib.sha256(path.read_bytes()).hexdigest():
                 raise RuntimeError(f"migration checksum mismatch: {path.name}")
         columns = {r["column_name"] for r in self.db.execute(
@@ -64,26 +83,44 @@ class PostgresStore:
         if not {"fingerprint_scheme", "network_fingerprint", "genesis_hash"} <= columns:
             raise RuntimeError("database lacks network identity capability")
 
+    def verify_runtime_principals(self, runtime_dsn: str, migration_dsn: str) -> None:
+        """Fail closed unless this connection is the explicitly named runtime role."""
+        runtime_user = conninfo_to_dict(runtime_dsn).get("user", "").strip()
+        migration_user = conninfo_to_dict(migration_dsn).get("user", "").strip()
+        actual_user = self.db.execute("SELECT current_user AS role").fetchone()["role"]
+        if not runtime_user or not migration_user:
+            raise RuntimeError("PostgreSQL runtime and migration DSNs must name database roles explicitly")
+        if runtime_user == migration_user or actual_user != runtime_user:
+            raise RuntimeError("PostgreSQL runtime and migration DSNs must use distinct principals matching the connected runtime role")
+        role = self.db.execute("SELECT rolsuper,rolcreaterole,rolcanlogin FROM pg_roles WHERE rolname=%s",
+                               (actual_user,)).fetchone()
+        if not role or role["rolsuper"] or role["rolcreaterole"] or not role["rolcanlogin"]:
+            raise RuntimeError("runtime principal must be a login without superuser or role-management privileges")
+        from orbis.deployment import runtime_role_is_privileged
+        if runtime_role_is_privileged(self.db, actual_user):
+            raise RuntimeError("runtime principal must not inherit registry executor or identity admin privileges")
+
     def resolve_network(self, context: NetworkContext) -> NetworkContext:
         if context.state is not TrustState.UNRESOLVED:
             raise ValueError("registry resolution requires verified RPC context")
         with self.db.transaction():
-            self.db.execute("""INSERT INTO networks(chain_id,name,environment,provider_name,
-                fingerprint_scheme,network_fingerprint,genesis_hash)
-                VALUES (%s,%s,COALESCE(NULLIF(%s,''),'unknown'),%s,%s,%s,%s)
-                ON CONFLICT (chain_id,fingerprint_scheme,network_fingerprint)
-                WHERE network_fingerprint IS NOT NULL DO NOTHING""",
-                (context.chain_id,self.network_name,self.network_environment,self.provider_name,
-                 context.fingerprint_scheme,context.network_fingerprint,context.genesis_hash))
-            row = self.db.execute("""SELECT network_id,chain_id,fingerprint_scheme,
-                network_fingerprint,genesis_hash FROM networks WHERE chain_id=%s
-                AND fingerprint_scheme=%s AND network_fingerprint=%s FOR KEY SHARE""",
-                (context.chain_id,context.fingerprint_scheme,context.network_fingerprint)).fetchone()
-            if not row:
-                raise LookupError("verified network identity could not be registered")
-            return resolved_context(context,int(row["network_id"]),stored_chain_id=row["chain_id"],
-                stored_scheme=row["fingerprint_scheme"],stored_fingerprint=row["network_fingerprint"],
-                stored_genesis_hash=row["genesis_hash"])
+            row_id = self.db.execute("""SELECT orbis_register_network_identity(
+                %s,%s,%s,%s,%s,%s,%s) AS network_id""",
+                (context.chain_id,context.fingerprint_scheme,context.network_fingerprint,
+                 context.genesis_hash,self.network_name,self.network_environment,self.provider_name)).fetchone()["network_id"]
+            row = None
+            if row_id is not None:
+                row = self.db.execute("""SELECT network_id,chain_id,fingerprint_scheme,
+                    network_fingerprint,genesis_hash FROM networks WHERE chain_id=%s
+                    AND fingerprint_scheme=%s AND network_fingerprint=%s AND network_id=%s""",
+                    (context.chain_id,context.fingerprint_scheme,context.network_fingerprint,row_id)).fetchone()
+        # Commit a rejection audit event before raising; raising inside the transaction
+        # would roll the function's audit insert back with the failed operation.
+        if row_id is None or not row:
+            raise LookupError("verified network identity could not be registered")
+        return resolved_context(context,int(row["network_id"]),stored_chain_id=row["chain_id"],
+            stored_scheme=row["fingerprint_scheme"],stored_fingerprint=row["network_fingerprint"],
+            stored_genesis_hash=row["genesis_hash"])
 
     @staticmethod
     def _network_id(context: NetworkContext) -> int:

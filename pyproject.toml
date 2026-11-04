@@ -12,6 +12,8 @@ dependencies = ["psycopg[binary]>=3.2,<4"]
 [project.scripts]
 orbis-index = "orbis.cli:main"
 orbis-db-migrate = "orbis.db_migrate:main"
+orbis-db-activate = "orbis.db_activate:main"
+orbis-db-fence = "orbis.db_fence:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

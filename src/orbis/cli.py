@@ -22,8 +22,14 @@ def main() -> None:
         from orbis.observer.postgres import PostgresStore
         store = PostgresStore(settings.database_url, network_name=settings.network_name,
                               network_environment=settings.network_environment,
-                              provider_name=settings.provider_name)
+                              provider_name=settings.provider_name, runtime_fenced=True)
     try:
+        if not settings.database_url.startswith("sqlite://"):
+            import os
+            store.verify_runtime_principals(
+                settings.database_url,
+                os.environ.get("ORBIS_MIGRATION_DATABASE_URL", "").strip(),
+            )
         if hasattr(store, "check_compatibility"):
             store.check_compatibility()
         result = Indexer(rpc, store, settings.chain_id, settings.confirmation_depth,
