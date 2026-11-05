@@ -115,11 +115,17 @@ class Indexer:
                 if transactions and not isinstance(transactions[0], dict):
                     raise RuntimeError("RPC block omitted full transaction objects")
                 receipts = []
+                seen_log_indexes: set[int] = set()
                 for tx in transactions:
                     receipt = self.rpc.receipt(tx["hash"])
                     if receipt is None:
                         raise RuntimeError(f"RPC returned no receipt for transaction {tx['hash']}")
                     self._validate_receipt(receipt, tx, block, number)
+                    for source_log in receipt.get("logs", []):
+                        log_index = self._quantity(source_log["logIndex"], "log index")
+                        if log_index in seen_log_indexes:
+                            raise RuntimeError(f"RPC returned duplicate log identity in block {number}")
+                        seen_log_indexes.add(log_index)
                     receipts.append(receipt)
                 # Block facts, transactions, receipt logs and checkpoint commit atomically.
                 self.store.commit_block(network_context, block, receipts, [])
@@ -158,29 +164,45 @@ class Indexer:
         ):
             raise RuntimeError("RPC block omitted complete transaction objects")
 
-    @classmethod
-    def _validate_receipt(cls, receipt: dict[str, Any], tx: dict[str, Any],
+    def _validate_receipt(self, receipt: dict[str, Any], tx: dict[str, Any],
                           block: dict[str, Any], number: int) -> None:
         if not isinstance(receipt, dict):
             raise RuntimeError(f"RPC returned malformed receipt for transaction {tx['hash']}")
         receipt_tx_hash = receipt.get("transactionHash")
         if not isinstance(receipt_tx_hash, str) or receipt_tx_hash.lower() != tx["hash"].lower():
             raise RuntimeError(f"RPC returned mismatched receipt for transaction {tx['hash']}")
-        if cls._quantity(receipt.get("blockNumber"), "receipt block number") != number:
+        if self._quantity(receipt.get("blockNumber"), "receipt block number") != number:
             raise RuntimeError(f"RPC returned receipt for wrong block: transaction {tx['hash']}")
         receipt_block_hash = receipt.get("blockHash")
         if not isinstance(receipt_block_hash, str) or receipt_block_hash.lower() != block["hash"].lower():
             raise RuntimeError(f"RPC returned receipt with wrong block hash: transaction {tx['hash']}")
+        status = receipt.get("status")
+        # Whitechain Sepolia's selected workflow requires EIP-658 receipt status.
+        # Other existing profiles retain their historical optional-status contract;
+        # whenever supplied, status is validated for every profile.
+        if status is None and self.chain_id == 1874:
+            raise RuntimeError(f"RPC receipt lacks required status for transaction {tx['hash']}")
+        if status is not None:
+            if isinstance(status, str) and status.startswith("0x"):
+                parsed_status = self._quantity(status, "receipt status")
+            elif isinstance(status, int) and not isinstance(status, bool):
+                parsed_status = status
+            else:
+                raise RuntimeError(f"RPC returned invalid receipt status for transaction {tx['hash']}")
+            if parsed_status not in (0, 1):
+                raise RuntimeError(f"RPC returned invalid receipt status for transaction {tx['hash']}")
         logs = receipt.get("logs")
         if not isinstance(logs, list):
             raise RuntimeError(f"RPC returned invalid receipt logs for transaction {tx['hash']}")
+        if status is not None and parsed_status == 0 and logs:
+            raise RuntimeError(f"RPC returned logs for failed transaction {tx['hash']}")
         for log in logs:
             log_tx_hash = log.get("transactionHash") if isinstance(log, dict) else None
             log_block_hash = log.get("blockHash") if isinstance(log, dict) else None
             if (not isinstance(log, dict)
                     or not isinstance(log_tx_hash, str) or log_tx_hash.lower() != tx["hash"].lower()
                     or not isinstance(log_block_hash, str) or log_block_hash.lower() != block["hash"].lower()
-                    or cls._quantity(log.get("blockNumber"), "log block number") != number
+                    or self._quantity(log.get("blockNumber"), "log block number") != number
                     or not isinstance(log.get("logIndex"), str)
                     or not isinstance(log.get("address"), str)
                     or not isinstance(log.get("topics"), list)

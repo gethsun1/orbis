@@ -144,10 +144,11 @@ class PostgresStore:
             # A canonical height has one block. Evidence references restrict removal of source
             # data; the deferred checkpoint FK permits safe replacement before cursor update.
             self.db.execute("DELETE FROM blocks WHERE network_id=%s AND number=%s AND hash<>%s", (network_id, number, block["hash"]))
-            self.db.execute("""INSERT INTO blocks(network_id,number,hash,parent_hash,timestamp,canonical)
-                VALUES(%s,%s,%s,%s,%s,TRUE) ON CONFLICT(network_id,hash) DO UPDATE SET
-                number=EXCLUDED.number,parent_hash=EXCLUDED.parent_hash,timestamp=EXCLUDED.timestamp,canonical=TRUE""",
-                (network_id, number, block["hash"], block["parentHash"], int(block["timestamp"], 16)))
+            self.db.execute("""INSERT INTO blocks(network_id,number,hash,parent_hash,timestamp,canonical,expected_transaction_count)
+                VALUES(%s,%s,%s,%s,%s,TRUE,%s) ON CONFLICT(network_id,hash) DO UPDATE SET
+                number=EXCLUDED.number,parent_hash=EXCLUDED.parent_hash,timestamp=EXCLUDED.timestamp,canonical=TRUE,
+                expected_transaction_count=EXCLUDED.expected_transaction_count""",
+                (network_id, number, block["hash"], block["parentHash"], int(block["timestamp"], 16), len(block.get("transactions", []))))
             self.db.execute("DELETE FROM transactions WHERE network_id=%s AND block_number=%s", (network_id, number))
             for index, tx in enumerate(block.get("transactions", [])):
                 sender = tx.get("from")

@@ -1,0 +1,20 @@
+{
+  "name": "orbis-orbt-test-token",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Isolated reproducible ORBIS Whitechain Sepolia test-token workspace",
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "deploy:whitechain-sepolia": "hardhat run scripts/deploy.js --network whitechainSepolia"
+  },
+  "devDependencies": {
+    "@nomicfoundation/hardhat-chai-matchers": "2.0.8",
+    "@nomicfoundation/hardhat-ethers": "3.0.8",
+    "@openzeppelin/contracts": "4.9.6",
+    "chai": "4.5.0",
+    "dotenv": "16.4.7",
+    "ethers": "6.13.5",
+    "hardhat": "2.26.3"
+  }
+}

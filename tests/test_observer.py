@@ -99,6 +99,28 @@ class ObserverTests(unittest.TestCase):
         self.assertEqual(self.store.checkpoint(1874), (0, genesis["hash"]))
         self.assertEqual(self.store.count("transactions", 1874), 0)
 
+    def test_whitechain_requires_receipt_status_without_changing_other_profile_contract(self):
+        block = make_block(1, "0x00")
+        tx = {"hash": "0xtx"}
+        receipt = {"transactionHash": "0xtx", "blockNumber": "0x1", "blockHash": block["hash"], "logs": []}
+        Indexer._validate_receipt(Indexer(FakeRpc({1: block}), self.store, 1), receipt, tx, block, 1)
+        with self.assertRaisesRegex(RuntimeError, "lacks required status"):
+            Indexer(FakeRpc({1: block}), self.store, 1874)._validate_receipt(receipt, tx, block, 1)
+        receipt["status"] = "0x2"
+        with self.assertRaisesRegex(RuntimeError, "invalid receipt status"):
+            Indexer(FakeRpc({1: block}), self.store, 1874)._validate_receipt(receipt, tx, block, 1)
+
+    def test_missing_whitechain_receipt_status_cannot_advance_checkpoint(self):
+        genesis = make_block(0, "0x00")
+        tx = {"hash": "0x01", "from": "0x11", "to": "0x22", "value": "0x0", "input": "0x"}
+        block = make_block(1, genesis["hash"], transactions=[tx])
+        rpc = FakeRpc({0: genesis, 1: block})
+        rpc.receipts[tx["hash"]] = {"transactionHash": tx["hash"], "blockNumber": "0x1",
+                                     "blockHash": block["hash"], "logs": []}
+        with self.assertRaisesRegex(RuntimeError, "lacks required status"):
+            Indexer(rpc, self.store, 1874, confirmation_depth=0).sync(start_block=0)
+        self.assertEqual(self.store.checkpoint(1874), (0, genesis["hash"]))
+
     def test_rejects_block_at_wrong_height_before_persistence(self):
         wrong = make_block(1, "0x00")
         rpc = FakeRpc({1: make_block(2, wrong["hash"])})
